@@ -1,0 +1,18 @@
+[package]
+name = "linperf"
+version = "0.1.0"
+edition = "2021"
+description = "Linux 单机综合性能分析"
+publish = false
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(linperf_ebpf)"] }
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.28"
+inferno = "0.11"
+libc = "0.2"
+ratatui = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
