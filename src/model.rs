@@ -56,9 +56,22 @@ pub struct NetCounters {
     pub rx_bytes: u64,
     pub rx_errs: u64,
     pub rx_drop: u64,
+    pub rx_fifo: u64,
+    pub rx_frame: u64,
     pub tx_bytes: u64,
     pub tx_errs: u64,
     pub tx_drop: u64,
+    pub tx_fifo: u64,
+    pub tx_colls: u64,
+    pub tx_carrier: u64,
+}
+
+/// `/proc/net/softnet_stat` 里各 CPU 的合计。dropped 是 backlog 丢包，squeezed 是一轮 softirq 没处理完。
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct SoftnetCounters {
+    pub dropped: u64,
+    pub squeezed: u64,
+    pub flow_limit: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -91,5 +104,6 @@ pub struct HostSample {
     pub psi_io: Option<Pressure>,
     pub disks: Vec<DiskCounters>,
     pub nets: Vec<NetCounters>,
+    pub softnet: SoftnetCounters,
     pub cgroup: Option<CgroupCounters>,
 }

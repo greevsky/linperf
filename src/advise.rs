@@ -14,7 +14,7 @@ pub fn action(finding: &Finding, procs: &[ProcRate]) -> Action {
         "cpu.saturated" | "cgroup.cpu_throttle" => cpu_advice(finding.id.as_str(), &actors),
         "memory.pressure" | "memory.swap" | "cgroup.memory_high" => mem_advice(finding.id.as_str(), &actors),
         "cpu.steal" => "steal 是宿主机抽走的时间。客人机里改代码或加线程都补不回。向宿主机要独占核，或降低超分。".into(),
-        "net.drops" => "丢包记在网卡上。先加大网卡队列并核对 softnet backlog，再把超时的服务和这个时间段对齐。这次没有拆到每个进程的连接。".into(),
+        "net.drops" => finding.next_step.clone(),
         "host.healthy" => "这一窗口没有越过阈值。卡顿如果已经过去，这次对不上；下次卡顿还在时再跑 snapshot 或 watch。".into(),
         _ => finding.next_step.clone(),
     };

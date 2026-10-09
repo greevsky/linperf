@@ -251,10 +251,16 @@ fn sample(
             rx_bytes: mono_ms * 1000,
             rx_errs: 0,
             rx_drop: 0,
+            rx_fifo: 0,
+            rx_frame: 0,
             tx_bytes: mono_ms * 500,
             tx_errs: 0,
             tx_drop: 0,
+            tx_fifo: 0,
+            tx_colls: 0,
+            tx_carrier: 0,
         }],
+        softnet: crate::model::SoftnetCounters::default(),
         cgroup: None,
     }
 }

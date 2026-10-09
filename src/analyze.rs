@@ -328,32 +328,33 @@ fn io_saturated(rates: &Rates) -> Option<Finding> {
 }
 
 fn net_drops(rates: &Rates) -> Option<Finding> {
-    let mut hot: Vec<_> = rates
-        .nets
-        .iter()
-        .filter(|net| net.errs_per_sec >= NET_ERR_PER_SEC)
-        .collect();
-    if hot.is_empty() {
+    let mut evidence = Vec::new();
+    for net in &rates.nets {
+        push_packet(&mut evidence, &net.name, "drop", net.drop_per_sec, "网卡丢包，缓冲或过滤丢掉的包");
+        push_packet(&mut evidence, &net.name, "err", net.err_per_sec, "驱动记为错误，还没拆到具体原因");
+        push_packet(&mut evidence, &net.name, "fifo", net.fifo_per_sec, "环形队列溢出，网卡来不及把包交给内核");
+        push_packet(&mut evidence, &net.name, "frame", net.frame_per_sec, "帧错误，报文在链路上损坏");
+        push_packet(&mut evidence, &net.name, "carrier", net.carrier_per_sec, "载波丢失，链路闪断");
+        push_packet(&mut evidence, &net.name, "colls", net.colls_per_sec, "冲突，半双工或异常环路");
+    }
+    push_packet(&mut evidence, "softnet", "dropped", rates.softnet_dropped_per_sec, "协议栈 backlog 丢包");
+    push_packet(&mut evidence, "softnet", "squeeze", rates.softnet_squeeze_per_sec, "softirq 预算用尽，这一轮包没处理完");
+    push_packet(&mut evidence, "softnet", "flow", rates.softnet_flow_per_sec, "单流限速丢包");
+    if evidence.is_empty() {
         return None;
     }
-    hot.sort_by(|a, b| {
-        b.errs_per_sec
-            .partial_cmp(&a.errs_per_sec)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let evidence = hot
-        .iter()
-        .take(3)
-        .map(|net| {
-            metric(
-                format!("net.errs_per_sec.{}", net.name),
-                net.errs_per_sec,
-                "packets/s",
-                "rx/tx 的 error 与 drop 之和",
-            )
-        })
-        .collect();
-    let worst = hot[0].errs_per_sec;
+    evidence.sort_by(|a, b| b.value.partial_cmp(&a.value).unwrap_or(std::cmp::Ordering::Equal));
+    let worst = evidence[0].value;
+    let kind = evidence[0].metric.clone();
+    let summary = format!(
+        "{} 在增加。{}",
+        evidence[0].note,
+        if kind.contains("frame") || kind.contains("carrier") || kind.contains("colls") {
+            "这是报文本身或链路异常，不是某个进程的 CPU。"
+        } else {
+            "这是网卡或协议栈处理不过来，要和套接字重传分开看。"
+        }
+    );
     Some(Finding {
         id: "net.drops".into(),
         severity: if worst >= 100.0 {
@@ -361,11 +362,33 @@ fn net_drops(rates: &Rates) -> Option<Finding> {
         } else {
             Severity::Warning
         },
-        title: "网卡错误或丢包".into(),
-        summary: "采样窗口里有网卡计数在增加。这还不能区分本机队列、驱动和链路。".into(),
+        title: "网卡数据包异常".into(),
+        summary,
+        next_step: packet_next_step(&kind),
         evidence,
-        next_step: "对照 softnet stat 和网卡驱动计数。应用超时要和这段时间对齐后再下结论。".into(),
     })
+}
+
+fn push_packet(evidence: &mut Vec<Evidence>, name: &str, kind: &str, value: f64, note: &str) {
+    if value < NET_ERR_PER_SEC {
+        return;
+    }
+    evidence.push(metric(
+        format!("net.{kind}_per_sec.{name}"),
+        value,
+        "packets/s",
+        note,
+    ));
+}
+
+fn packet_next_step(metric: &str) -> String {
+    if metric.contains("frame") || metric.contains("carrier") || metric.contains("colls") {
+        "先看网线、光模块和对端交换机口的错误计数。帧错误和载波丢失是链路问题，加大应用线程没用。".into()
+    } else if metric.contains("fifo") || metric.contains("squeeze") || metric.contains("flow") || metric.contains("dropped") {
+        "协议栈或网卡队列处理不过来。对照同一窗口的 softnet dropped 和 time_squeeze，再考虑加大网卡 ring 和 net.core.netdev_max_backlog。".into()
+    } else {
+        "驱动把多种异常都记在 errs 里。先看同一网卡的溢出、帧错误和载波是不是也在涨，再查驱动私有计数。".into()
+    }
 }
 
 fn cgroup_cpu(rates: &Rates) -> Option<Finding> {
@@ -452,6 +475,20 @@ mod tests {
             .iter()
             .flat_map(|item| &item.evidence)
             .any(|item| item.metric.starts_with("disk.util.")));
+    }
+
+    #[test]
+    fn frame_errors_are_named_apart_from_queue_overflow() {
+        let samples = demo::timeline();
+        let mut rates = between(&samples[0], &samples[1]).unwrap();
+        rates.nets[0].frame_per_sec = 12.0;
+        rates.softnet_squeeze_per_sec = 4.0;
+        let findings = analyze(&rates);
+        let net = findings.iter().find(|item| item.id == "net.drops").unwrap();
+        assert!(net.summary.contains("帧错误"));
+        assert!(net.evidence.iter().any(|item| item.metric.contains("frame")));
+        assert!(net.evidence.iter().any(|item| item.metric.contains("squeeze")));
+        assert!(net.next_step.contains("链路"));
     }
 
     #[test]

@@ -104,7 +104,7 @@ pub fn format_check(caps: &HostCaps) -> String {
         "无法采集"
     };
     let mut lines = vec![
-        "linperf  快速定位本机性能瓶颈".into(),
+        format!("{}  本机采集路径", crate::identity::PRODUCT),
         format!("系统    {} ({})", caps.os, caps.distro_id),
         format!("内核    {}", caps.kernel),
         format!("架构    {}", caps.arch),
@@ -137,6 +137,7 @@ pub fn format_check(caps: &HostCaps) -> String {
     }
     lines.push(String::new());
     lines.push("采集只读 /proc、/sys 和 cgroup，随内核能力降级。".into());
+    crate::identity::sign(&mut lines);
     lines.join("\n")
 }
 
@@ -293,7 +294,7 @@ pub fn detect() -> Result<HostCaps> {
             cap_bpf: false,
             cap_perfmon: false,
             cap_sys_admin: false,
-            ebpf_linked: cfg!(linperf_ebpf),
+            ebpf_linked: cfg!(linji_ebpf),
         })
     }
 }
@@ -345,7 +346,7 @@ fn detect_linux() -> HostCaps {
         cap_bpf: has_cap(eff, 39),
         cap_perfmon: has_cap(eff, 38),
         cap_sys_admin: has_cap(eff, 21),
-        ebpf_linked: cfg!(linperf_ebpf),
+        ebpf_linked: cfg!(linji_ebpf),
     }
 }
 

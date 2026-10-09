@@ -96,7 +96,7 @@ pub fn format_report(items: &[CheckItem], host: &str, color: bool) -> String {
     }
     let widths = table_widths();
     let mut lines = vec![
-        "linperf  等保三级安全基线".into(),
+        format!("{}  等保三级安全基线", crate::identity::PRODUCT),
         format!("主机    {host}"),
         "标准    GB/T 22239-2019 安全计算环境。下表只列本机可自动核对的控制点，通过不等于测评结论。".into(),
         String::new(),
@@ -111,6 +111,7 @@ pub fn format_report(items: &[CheckItem], host: &str, color: bool) -> String {
         lines.push(dye(color, 1, domain));
         lines.push(render_domain_table(&rows, &widths, color));
     }
+    crate::identity::sign(&mut lines);
     lines.join("\n")
 }
 

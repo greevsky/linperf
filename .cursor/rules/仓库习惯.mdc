@@ -1,0 +1,14 @@
+---
+description: 提交、备份和作者按我的仓库口径来
+alwaysApply: true
+---
+
+# 仓库习惯
+
+我是 lei，邮箱 mr.greevsky@gmail.com。仓库是 https://github.com/greevsky/linperf 。工具对外叫临机，命令是 linji。GitHub 仓库名还没改成 linji 之前，工具里的地址继续用现在这个仓库。
+
+提交说明用中文，用我的口吻写，说明我为什么改。例如：「我把导航上的日志入口提前，现场先看服务状态。」不要写成助手汇报。
+
+能独立留下的改动，提交后推到 origin，当作备份。不提交密钥和 target。不改 git 配置，不强制推送。
+
+工具里出现的作者和版权跟仓库对齐：版权所有 © 2026 lei <mr.greevsky@gmail.com>，地址用上面的仓库。eBPF 字节码保持内核要求的 GPL。

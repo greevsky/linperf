@@ -73,7 +73,7 @@ pub fn demo_len() -> usize {
 
 fn demo_host() -> HostCaps {
     HostCaps {
-        os: "linperf demo".into(),
+        os: "临机演示".into(),
         kernel: "demo".into(),
         arch: std::env::consts::ARCH.into(),
         procfs: true,
@@ -131,7 +131,8 @@ pub fn inspect_text(interval_secs: u64, pid: i32) -> Result<String> {
     let extra = procs::extra(pid);
     let mut lines = Vec::new();
     lines.push(format!(
-        "linperf  进程 {}  pid {}    {} {}",
+        "{}  进程 {}  pid {}    {} {}",
+        crate::identity::PRODUCT,
         proc.comm, proc.pid, host.os, host.kernel
     ));
     lines.push(format!(
@@ -195,5 +196,6 @@ pub fn inspect_text(interval_secs: u64, pid: i32) -> Result<String> {
     }
     lines.push(String::new());
     lines.push(format!("建议    {}", advise::for_process(&proc, Some(&extra))));
+    crate::identity::sign(&mut lines);
     Ok(lines.join("\n"))
 }

@@ -21,7 +21,8 @@ pub fn format_text(snapshot: &Snapshot) -> String {
     let rates = &snapshot.rates;
     let mut lines = Vec::new();
     lines.push(format!(
-        "linperf  定位{}",
+        "{}  定位{}",
+        crate::identity::PRODUCT,
         if snapshot.demo { "（演示数据）" } else { "" }
     ));
     if let Some(finding) = snapshot.findings.first() {
@@ -123,6 +124,7 @@ pub fn format_text(snapshot: &Snapshot) -> String {
             lines.push(format!("  下一步: {}", finding.next_step));
         }
     }
+    crate::identity::sign(&mut lines);
     lines.join("\n")
 }
 

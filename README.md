@@ -1,23 +1,26 @@
-# linperf
+# 临机
 
-在一台 Linux 上快速定位性能瓶颈。打开先看到结论、证据和下一步，指标留在旁边做对照。用来做现场排查，结论要能回到采样窗口里的计数。
+我把这个工具放在一台 Linux 上。打开先进入导航：硬件、进程、容器、防火墙、网络、日志。性能定位、等保基线和抓包都在里面，所以不再叫 linperf。
 
-采集只读 `/proc`、`/sys` 和 cgroup。发行版不同时按内核能力降级：没有 PSI、只有 cgroup v1、或者内核太旧，计数分析仍然可用。`linperf check` 会写出当前机器实际走哪条路径。
+命令是 `linji`。采集只读 `/proc`、`/sys` 和 cgroup。发行版不同时按内核能力降级：没有 PSI、只有 cgroup v1、或者内核太旧，计数分析仍然可用。`linji check` 会写出这台机器实际走哪条路径。
 
-界面以当前选中的结论为第一眼。`j` / `k` 在结论之间切换，证据和下一步跟着变；仪表只高亮和这条结论相关的那一项。
+界面以导航为入口。`1` 到 `6` 进入各块，`j` / `k` 移动，回车进入。性能结论里，证据和下一步跟着当前选中的那条变。
 
-研制范围见 [docs/研制记录.md](docs/研制记录.md)。
+研制过程见 [docs/研制记录.md](docs/研制记录.md)。
+
+版权所有 © 2026 lei <mr.greevsky@gmail.com>
+https://github.com/greevsky/linperf
 
 在 Linux 上：
 
 ```bash
 cargo test
 cargo build --release
-./target/release/linperf check
-./target/release/linperf snapshot
-./target/release/linperf snapshot --demo
-./target/release/linperf watch
-./target/release/linperf flame --demo -o /tmp/linperf.svg
+./target/release/linji
+./target/release/linji check
+./target/release/linji snapshot
+./target/release/linji baseline
+./target/release/linji flame --demo -o /tmp/linji.svg
 ```
 
 `profile oncpu` / `profile offcpu` 要等 eBPF 字节码编进这个二进制之后才能采样。现在运行它会说明缺什么。

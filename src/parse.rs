@@ -194,12 +194,39 @@ pub fn parse_netdev(text: &str) -> Vec<NetCounters> {
             rx_bytes: parts[0].parse().unwrap_or(0),
             rx_errs: parts[2].parse().unwrap_or(0),
             rx_drop: parts[3].parse().unwrap_or(0),
+            rx_fifo: parts[4].parse().unwrap_or(0),
+            rx_frame: parts[5].parse().unwrap_or(0),
             tx_bytes: parts[8].parse().unwrap_or(0),
             tx_errs: parts[10].parse().unwrap_or(0),
             tx_drop: parts[11].parse().unwrap_or(0),
+            tx_fifo: parts[12].parse().unwrap_or(0),
+            tx_colls: parts[13].parse().unwrap_or(0),
+            tx_carrier: parts[14].parse().unwrap_or(0),
         });
     }
     nets
+}
+
+pub fn parse_softnet(text: &str) -> crate::model::SoftnetCounters {
+    let mut total = crate::model::SoftnetCounters::default();
+    for line in text.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 3 {
+            continue;
+        }
+        let hex = |index: usize| {
+            parts
+                .get(index)
+                .and_then(|value| u64::from_str_radix(value, 16).ok())
+                .unwrap_or(0)
+        };
+        total.dropped += hex(1);
+        total.squeezed += hex(2);
+        if parts.len() > 6 {
+            total.flow_limit += hex(6);
+        }
+    }
+    total
 }
 
 pub fn parse_cpu_stat(text: &str) -> (u64, u64) {
@@ -371,11 +398,20 @@ intr 1
         assert_eq!(disks[0].io_ms, 40);
 
         let nets = parse_netdev(
-            "Inter-|   Receive\n face |bytes\n  lo: 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0\n  eth0: 100 1 2 3 0 0 0 0 200 1 4 5 0 0 0 0\n",
+            "Inter-|   Receive\n face |bytes\n  lo: 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0\n  eth0: 100 1 2 3 7 8 0 0 200 1 4 5 9 6 11 0\n",
         );
         assert_eq!(nets.len(), 1);
         assert_eq!(nets[0].rx_errs, 2);
+        assert_eq!(nets[0].rx_fifo, 7);
+        assert_eq!(nets[0].rx_frame, 8);
         assert_eq!(nets[0].tx_drop, 5);
+        assert_eq!(nets[0].tx_fifo, 9);
+        assert_eq!(nets[0].tx_colls, 6);
+        assert_eq!(nets[0].tx_carrier, 11);
+        let softnet = parse_softnet("0000000a 00000002 00000003 00000000 00000000 00000000 00000004\n");
+        assert_eq!(softnet.dropped, 2);
+        assert_eq!(softnet.squeezed, 3);
+        assert_eq!(softnet.flow_limit, 4);
 
         let pressure = parse_pressure("some avg10=1.50 avg60=0.20 avg300=0.00 total=9\nfull avg10=0.40 avg60=0.10 avg300=0.00 total=3\n");
         assert!((pressure.some_avg10 - 1.5).abs() < 0.001);

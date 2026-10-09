@@ -13,10 +13,16 @@ use crate::session;
 use crate::tui;
 
 #[derive(Parser)]
-#[command(name = "linperf", about = "在一台 Linux 上快速定位性能瓶颈")]
+#[command(
+    name = "linji",
+    author,
+    version,
+    about = "我放在这台 Linux 上的综合工具。直接运行进入导航：硬件、进程、容器、防火墙、网络、日志",
+    long_about = "临机。我放在一台 Linux 上，打开先进入导航：硬件、进程、容器、防火墙、网络、日志。性能定位、等保基线、抓包和吞吐都在里面。\n版权所有 © 2026 lei <mr.greevsky@gmail.com>\nhttps://github.com/greevsky/linperf"
+)]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -59,7 +65,7 @@ enum Command {
         out: PathBuf,
         #[arg(long)]
         demo: bool,
-        #[arg(long, default_value = "linperf")]
+        #[arg(long, default_value = "临机")]
         title: String,
     },
     /// 采集 on-CPU 或 off-CPU 栈。当前构建未嵌入字节码时会说明原因
@@ -107,7 +113,13 @@ enum Command {
 }
 
 pub fn run() -> Result<()> {
-    match Cli::parse().command {
+    let command = Cli::parse()
+        .command
+        .unwrap_or(Command::Watch {
+            interval: 1,
+            demo: false,
+        });
+    match command {
         Command::Check => {
             println!("{}", session::check_text()?);
         }

@@ -60,6 +60,77 @@ pub struct ProcExtra {
     pub fd_count: Option<usize>,
     pub nofile_soft: Option<u64>,
     pub stack: Option<String>,
+    pub runtime: String,
+    pub namespaces: String,
+    pub netns_private: bool,
+    pub rss_anon_kb: Option<u64>,
+    pub rss_file_kb: Option<u64>,
+    pub rss_shmem_kb: Option<u64>,
+    pub vm_hwm_kb: Option<u64>,
+    pub vm_data_kb: Option<u64>,
+    pub vm_pte_kb: Option<u64>,
+    pub read_bytes: Option<u64>,
+    pub write_bytes: Option<u64>,
+    pub syscr: Option<u64>,
+    pub syscw: Option<u64>,
+    pub blkio_secs: Option<f64>,
+    pub runqueue_ms: Option<f64>,
+    pub fd_files: usize,
+    pub fd_sockets: usize,
+    pub fd_pipes: usize,
+    pub net: ProcNet,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProcNet {
+    pub established: usize,
+    pub listen: usize,
+    pub close_wait: usize,
+    pub time_wait: usize,
+    pub syn: usize,
+    pub udp: usize,
+    pub retrans: u64,
+    pub rx_queue: u64,
+    pub tx_queue: u64,
+    pub listen_backlog: u64,
+    pub sockets: Vec<String>,
+    pub hidden: usize,
+    pub ifaces: Vec<IfaceCount>,
+    pub note: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct IfaceCount {
+    pub name: String,
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    pub drops: u64,
+    pub errs: u64,
+    pub fifo: u64,
+    pub frame: u64,
+    pub carrier: u64,
+    pub colls: u64,
+}
+
+impl ProcNet {
+    pub fn empty() -> Self {
+        Self {
+            established: 0,
+            listen: 0,
+            close_wait: 0,
+            time_wait: 0,
+            syn: 0,
+            udp: 0,
+            retrans: 0,
+            rx_queue: 0,
+            tx_queue: 0,
+            listen_backlog: 0,
+            sockets: Vec::new(),
+            hidden: 0,
+            ifaces: Vec::new(),
+            note: String::new(),
+        }
+    }
 }
 
 pub fn capture() -> ProcShot {
@@ -182,23 +253,510 @@ pub fn extra(pid: i32) -> ProcExtra {
         .ok()
         .and_then(|text| crate::parse::parse_cgroup_path(&text))
         .unwrap_or_default();
-    let fd_count = fs::read_dir(format!("/proc/{pid}/fd")).ok().map(|dir| dir.count());
+    let status = fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+    let kv = parse_status_kv(&status);
+    let (fd_files, fd_sockets, fd_pipes, socket_inodes) = fd_kinds(pid);
+    let fd_count = Some(fd_files + fd_sockets + fd_pipes);
     let nofile_soft = fs::read_to_string(format!("/proc/{pid}/limits"))
         .ok()
         .as_deref()
         .and_then(parse_nofile_soft);
     let stack = fs::read_to_string(format!("/proc/{pid}/stack")).ok().map(|text| {
         text.lines()
-            .take(8)
+            .filter(|line| !line.trim().is_empty())
+            .take(16)
             .collect::<Vec<_>>()
             .join("\n")
     }).filter(|text| !text.trim().is_empty());
+    let isolated = isolated_namespaces(pid);
+    let (runtime, namespaces) = describe_runtime(&cgroup, &isolated);
+    let netns_private = isolated.iter().any(|item| item == "net");
+    let io = fs::read_to_string(format!("/proc/{pid}/io")).unwrap_or_default();
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+    let blkio_secs = parse_stat(&stat).and_then(|(_, _, fields)| {
+        fields
+            .get(39)
+            .and_then(|text| text.parse::<u64>().ok())
+            .map(|ticks| ticks as f64 / USER_HZ)
+    });
+    let runqueue_ms = fs::read_to_string(format!("/proc/{pid}/schedstat"))
+        .ok()
+        .and_then(|text| text.split_whitespace().nth(1)?.parse::<u64>().ok())
+        .map(|ns| ns as f64 / 1_000_000.0);
     ProcExtra {
         user,
         cgroup,
         fd_count,
         nofile_soft,
         stack,
+        runtime,
+        namespaces,
+        netns_private,
+        rss_anon_kb: kb_field(&kv, "RssAnon"),
+        rss_file_kb: kb_field(&kv, "RssFile"),
+        rss_shmem_kb: kb_field(&kv, "RssShmem"),
+        vm_hwm_kb: kb_field(&kv, "VmHWM"),
+        vm_data_kb: kb_field(&kv, "VmData"),
+        vm_pte_kb: kb_field(&kv, "VmPTE"),
+        read_bytes: io_opt(&io, "read_bytes:"),
+        write_bytes: io_opt(&io, "write_bytes:"),
+        syscr: io_opt(&io, "syscr:"),
+        syscw: io_opt(&io, "syscw:"),
+        blkio_secs,
+        runqueue_ms,
+        fd_files,
+        fd_sockets,
+        fd_pipes,
+        net: collect_net(pid, &socket_inodes),
+    }
+}
+
+pub fn describe_runtime(cgroup: &str, isolated: &[String]) -> (String, String) {
+    let namespaces = if isolated.is_empty() {
+        "与宿主机相同".into()
+    } else {
+        format!("{} 与宿主机隔离", isolated.join("、"))
+    };
+    let runtime = if let Some((kind, id)) = container_identity(cgroup) {
+        format!("容器 · {kind} · {id}")
+    } else if isolated.iter().any(|item| item == "pid" || item == "mnt") {
+        "容器 · 运行时未从 cgroup 识别".into()
+    } else if let Some(unit) = systemd_unit(cgroup) {
+        format!("宿主机 · systemd · {unit}")
+    } else if cgroup.contains("user.slice") || cgroup.contains("session") {
+        "宿主机 · 用户会话".into()
+    } else if isolated.iter().any(|item| item == "net") {
+        "宿主机 · 独立网络命名空间".into()
+    } else {
+        "宿主机".into()
+    };
+    (runtime, namespaces)
+}
+
+fn container_identity(cgroup: &str) -> Option<(&'static str, String)> {
+    let lower = cgroup.to_ascii_lowercase();
+    let kind = if lower.contains("kubepods") {
+        "kubernetes"
+    } else if lower.contains("docker") {
+        "docker"
+    } else if lower.contains("containerd") {
+        "containerd"
+    } else if lower.contains("crio") || lower.contains("cri-o") {
+        "cri-o"
+    } else if lower.contains("libpod") || lower.contains("podman") {
+        "podman"
+    } else if lower.contains("/lxc/") || lower.contains("lxc-") {
+        "lxc"
+    } else {
+        return None;
+    };
+    let id = hex_token(cgroup).unwrap_or_else(|| "未写出 id".into());
+    Some((kind, id))
+}
+
+fn hex_token(path: &str) -> Option<String> {
+    let bytes = path.as_bytes();
+    let mut index = 0;
+    let mut found = None;
+    while index < bytes.len() {
+        if bytes[index].is_ascii_hexdigit() {
+            let start = index;
+            while index < bytes.len() && bytes[index].is_ascii_hexdigit() {
+                index += 1;
+            }
+            if index - start >= 12 {
+                found = Some(path[start..start + 12].to_string());
+            }
+        } else {
+            index += 1;
+        }
+    }
+    found
+}
+
+#[derive(Debug, Clone)]
+pub struct ContainerGroup {
+    pub runtime: String,
+    pub id: String,
+    pub tasks: usize,
+    pub rss_kb: u64,
+    pub comms: String,
+}
+
+pub fn list_containers() -> Vec<ContainerGroup> {
+    let mut groups: HashMap<(String, String), (usize, u64, Vec<String>)> = HashMap::new();
+    let Ok(dir) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let page_kb = page_kb();
+    for entry in dir.flatten() {
+        let pid = entry.file_name();
+        let pid = pid.to_string_lossy();
+        if !pid.chars().all(|ch| ch.is_ascii_digit()) {
+            continue;
+        }
+        let cgroup = fs::read_to_string(format!("/proc/{pid}/cgroup"))
+            .ok()
+            .and_then(|text| crate::parse::parse_cgroup_path(&text))
+            .unwrap_or_default();
+        let Some((runtime, id)) = container_identity(&cgroup) else {
+            continue;
+        };
+        let pages = fs::read_to_string(format!("/proc/{pid}/statm"))
+            .ok()
+            .and_then(|text| text.split_whitespace().nth(1)?.parse::<u64>().ok())
+            .unwrap_or(0);
+        let comm = fs::read_to_string(format!("/proc/{pid}/comm"))
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let slot = groups.entry((runtime.to_string(), id)).or_default();
+        slot.0 += 1;
+        slot.1 += pages * page_kb;
+        if !comm.is_empty() && !slot.2.contains(&comm) && slot.2.len() < 4 {
+            slot.2.push(comm);
+        }
+    }
+    let mut rows: Vec<_> = groups
+        .into_iter()
+        .map(|((runtime, id), (tasks, rss_kb, comms))| ContainerGroup {
+            runtime,
+            id,
+            tasks,
+            rss_kb,
+            comms: comms.join("、"),
+        })
+        .collect();
+    rows.sort_by(|left, right| right.rss_kb.cmp(&left.rss_kb).then(left.id.cmp(&right.id)));
+    rows
+}
+
+pub fn demo_containers() -> Vec<ContainerGroup> {
+    vec![ContainerGroup {
+        runtime: "docker".into(),
+        id: "a247dff2ff6d".into(),
+        tasks: 21,
+        rss_kb: 133 * 1024,
+        comms: "minio".into(),
+    }]
+}
+
+fn page_kb() -> u64 {
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page > 0 {
+        page as u64 / 1024
+    } else {
+        4
+    }
+}
+
+fn isolated_namespaces(pid: i32) -> Vec<String> {
+    ["pid", "mnt", "net", "uts", "ipc", "user"]
+        .into_iter()
+        .filter(|name| namespace_differs(pid, name))
+        .map(|name| name.to_string())
+        .collect()
+}
+
+fn namespace_differs(pid: i32, name: &str) -> bool {
+    let own = fs::read_link(format!("/proc/{pid}/ns/{name}")).ok();
+    let mine = fs::read_link(format!("/proc/self/ns/{name}")).ok();
+    match (own, mine) {
+        (Some(left), Some(right)) => left != right,
+        _ => false,
+    }
+}
+
+fn fd_kinds(pid: i32) -> (usize, usize, usize, Vec<u64>) {
+    let Ok(entries) = fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return (0, 0, 0, Vec::new());
+    };
+    let mut files = 0;
+    let mut sockets = 0;
+    let mut pipes = 0;
+    let mut inodes = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(target) = fs::read_link(entry.path()) else {
+            files += 1;
+            continue;
+        };
+        let target = target.to_string_lossy();
+        if let Some(inode) = target
+            .strip_prefix("socket:[")
+            .and_then(|rest| rest.strip_suffix(']'))
+            .and_then(|text| text.parse().ok())
+        {
+            sockets += 1;
+            inodes.push(inode);
+        } else if target.starts_with("pipe:") {
+            pipes += 1;
+        } else {
+            files += 1;
+        }
+    }
+    (files, sockets, pipes, inodes)
+}
+
+fn io_opt(text: &str, key: &str) -> Option<u64> {
+    if text.is_empty() {
+        return None;
+    }
+    Some(parse_io_counter(text, key))
+}
+
+pub fn collect_net(pid: i32, inodes: &[u64]) -> ProcNet {
+    if inodes.is_empty() {
+        let mut net = ProcNet::empty();
+        net.ifaces = read_ifaces(pid);
+        return net;
+    }
+    let mut wanted = std::collections::HashSet::new();
+    wanted.extend(inodes.iter().copied());
+    let mut socks = Vec::new();
+    for name in ["tcp", "tcp6"] {
+        if let Ok(text) = fs::read_to_string(format!("/proc/{pid}/net/{name}")) {
+            socks.extend(parse_tcp_table(&text).into_iter().filter(|sock| wanted.contains(&sock.inode)));
+        }
+    }
+    let mut udp = 0usize;
+    for name in ["udp", "udp6"] {
+        if let Ok(text) = fs::read_to_string(format!("/proc/{pid}/net/{name}")) {
+            udp += parse_tcp_table(&text)
+                .into_iter()
+                .filter(|sock| wanted.contains(&sock.inode))
+                .count();
+        }
+    }
+    summarize_sockets(socks, udp, read_ifaces(pid))
+}
+
+fn read_ifaces(pid: i32) -> Vec<IfaceCount> {
+    fs::read_to_string(format!("/proc/{pid}/net/dev"))
+        .ok()
+        .map(|text| parse_netdev(&text))
+        .unwrap_or_default()
+}
+
+pub fn parse_tcp_table(text: &str) -> Vec<TcpSock> {
+    text.lines().filter_map(parse_tcp_row).collect()
+}
+
+pub fn parse_tcp_row(line: &str) -> Option<TcpSock> {
+    let mut parts = line.split_whitespace();
+    let sl = parts.next()?;
+    if sl == "sl" {
+        return None;
+    }
+    let local = hex_endpoint(parts.next()?)?;
+    let remote = hex_endpoint(parts.next()?)?;
+    let state = tcp_state(parts.next()?);
+    let queues = parts.next()?;
+    let (tx, rx) = queues.split_once(':')?;
+    let tx_queue = u64::from_str_radix(tx, 16).ok()?;
+    let rx_queue = u64::from_str_radix(rx, 16).ok()?;
+    let _timer = parts.next()?;
+    let retrans = u64::from_str_radix(parts.next()?, 16).ok()?;
+    let _uid = parts.next()?;
+    let _timeout = parts.next()?;
+    let inode = parts.next()?.parse().ok()?;
+    Some(TcpSock {
+        local,
+        remote,
+        state,
+        tx_queue,
+        rx_queue,
+        retrans,
+        inode,
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct TcpSock {
+    pub local: String,
+    pub remote: String,
+    pub state: String,
+    pub tx_queue: u64,
+    pub rx_queue: u64,
+    pub retrans: u64,
+    pub inode: u64,
+}
+
+fn summarize_sockets(mut socks: Vec<TcpSock>, udp: usize, ifaces: Vec<IfaceCount>) -> ProcNet {
+    socks.sort_by(|left, right| {
+        right
+            .retrans
+            .cmp(&left.retrans)
+            .then(right.tx_queue.cmp(&left.tx_queue))
+            .then(left.state.cmp(&right.state))
+    });
+    let mut net = ProcNet::empty();
+    net.udp = udp;
+    net.ifaces = ifaces;
+    for sock in &socks {
+        match sock.state.as_str() {
+            "已建立" => net.established += 1,
+            "监听" => {
+                net.listen += 1;
+                net.listen_backlog = net.listen_backlog.max(sock.tx_queue);
+            }
+            "等关闭" => net.close_wait += 1,
+            "时间等待" => net.time_wait += 1,
+            "发出握手" | "收到握手" => net.syn += 1,
+            _ => {}
+        }
+        net.retrans += sock.retrans;
+        net.rx_queue += sock.rx_queue;
+        net.tx_queue += sock.tx_queue;
+    }
+    let limit = 24;
+    net.hidden = socks.len().saturating_sub(limit);
+    net.sockets = socks
+        .iter()
+        .take(limit)
+        .map(|sock| {
+            if sock.state == "监听" {
+                format!(
+                    "{:<22}  {:<8}  未取走 {}",
+                    sock.local,
+                    sock.state,
+                    human_bytes(sock.tx_queue)
+                )
+            } else {
+                format!(
+                    "{:<22} ← {:<22}  {:<8}  重传 {}  收 {}  发 {}",
+                    sock.local,
+                    sock.remote,
+                    sock.state,
+                    sock.retrans,
+                    human_bytes(sock.rx_queue),
+                    human_bytes(sock.tx_queue)
+                )
+            }
+        })
+        .collect();
+    net.note = net_note(&net);
+    net
+}
+
+fn net_note(net: &ProcNet) -> String {
+    let mut parts = Vec::new();
+    if net.close_wait >= 5 {
+        parts.push(format!(
+            "有 {} 条等关闭（CLOSE_WAIT）。对端已经关闭，本进程还没 close，先查连接是否泄漏。",
+            net.close_wait
+        ));
+    }
+    if net.retrans > 0 {
+        parts.push(format!(
+            "套接字重传累计 {}。链路丢包或对端处理不过来时，业务会先变慢。",
+            net.retrans
+        ));
+    }
+    if net.listen_backlog >= 32 {
+        parts.push(format!(
+            "监听队列里有 {} 字节未取走。accept 跟不上新连接。",
+            human_bytes(net.listen_backlog)
+        ));
+    }
+    if net.time_wait >= 200 {
+        parts.push(format!(
+            "时间等待 {} 条。短连接过多时会占满本地端口。",
+            net.time_wait
+        ));
+    }
+    parts.join(" ")
+}
+
+pub fn hex_endpoint(text: &str) -> Option<String> {
+    let (addr, port) = text.split_once(':')?;
+    let port = u16::from_str_radix(port, 16).ok()?;
+    if addr.len() == 8 {
+        let raw = u32::from_str_radix(addr, 16).ok()?;
+        let bytes = raw.to_be_bytes();
+        return Some(format!(
+            "{}.{}.{}.{}:{port}",
+            bytes[3], bytes[2], bytes[1], bytes[0]
+        ));
+    }
+    if addr.len() == 32 {
+        let mut groups = Vec::new();
+        for index in 0..4 {
+            let word = u32::from_str_radix(&addr[index * 8..index * 8 + 8], 16).ok()?;
+            let bytes = word.to_be_bytes();
+            groups.push(format!("{:02x}{:02x}", bytes[3], bytes[2]));
+            groups.push(format!("{:02x}{:02x}", bytes[1], bytes[0]));
+        }
+        return Some(format!("[{}]:{port}", groups.join(":")));
+    }
+    None
+}
+
+fn tcp_state(code: &str) -> String {
+    match code.to_ascii_uppercase().as_str() {
+        "01" => "已建立",
+        "02" => "发出握手",
+        "03" => "收到握手",
+        "04" | "05" => "结束等待",
+        "06" => "时间等待",
+        "07" => "关闭",
+        "08" => "等关闭",
+        "09" => "最后确认",
+        "0A" => "监听",
+        "0B" => "关闭中",
+        _ => "未知",
+    }
+    .into()
+}
+
+pub fn parse_netdev(text: &str) -> Vec<IfaceCount> {
+    let mut rows = Vec::new();
+    for line in text.lines().skip(2) {
+        let Some((name, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let mut parts = rest.split_whitespace();
+        let num = |parts: &mut std::str::SplitWhitespace| {
+            parts.next().and_then(|value| value.parse().ok()).unwrap_or(0)
+        };
+        let rx_bytes = num(&mut parts);
+        let _rx_packets = parts.next();
+        let rx_err = num(&mut parts);
+        let rx_drop = num(&mut parts);
+        let rx_fifo = num(&mut parts);
+        let rx_frame = num(&mut parts);
+        let _rx_compressed = parts.next();
+        let _rx_multicast = parts.next();
+        let tx_bytes = num(&mut parts);
+        let _tx_packets = parts.next();
+        let tx_err = num(&mut parts);
+        let tx_drop = num(&mut parts);
+        let tx_fifo = num(&mut parts);
+        let tx_colls = num(&mut parts);
+        let tx_carrier = num(&mut parts);
+        rows.push(IfaceCount {
+            name: name.trim().to_string(),
+            rx_bytes,
+            tx_bytes,
+            drops: rx_drop + tx_drop,
+            errs: rx_err + tx_err,
+            fifo: rx_fifo + tx_fifo,
+            frame: rx_frame,
+            carrier: tx_carrier,
+            colls: tx_colls,
+        });
+    }
+    rows
+}
+
+pub fn human_bytes(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 * 1024 {
+        format!("{:.1}GiB", bytes as f64 / 1024.0 / 1024.0 / 1024.0)
+    } else if bytes >= 1024 * 1024 {
+        format!("{:.1}MiB", bytes as f64 / 1024.0 / 1024.0)
+    } else if bytes >= 1024 {
+        format!("{:.0}KiB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes}B")
     }
 }
 
@@ -528,5 +1086,29 @@ Max open files            1024                 4096                 files\n";
             Some("api.service".into())
         );
         assert_eq!(systemd_unit("/user.slice/session-3.scope"), None);
+    }
+
+    #[test]
+    fn docker_scope_is_a_container() {
+        let path = "/system.slice/docker-a247dff2ff6d1a9e19b1cddeb11725d937bf0b2533b9f3f7bf011b21f242097d.scope";
+        let (runtime, namespaces) = describe_runtime(path, &["pid".into(), "mnt".into(), "net".into()]);
+        assert_eq!(runtime, "容器 · docker · a247dff2ff6d");
+        assert!(namespaces.contains("net"));
+        let (host, same) = describe_runtime("/system.slice/nginx.service", &[]);
+        assert_eq!(host, "宿主机 · systemd · nginx.service");
+        assert_eq!(same, "与宿主机相同");
+    }
+
+    #[test]
+    fn tcp_row_keeps_address_retrans_and_inode() {
+        let line = "   0: 0100007F:0050 00000000:1F90 01 00000010:00000020 00:00000000 00000002     0        0 4242 1 0 0 0";
+        let sock = parse_tcp_row(line).unwrap();
+        assert_eq!(sock.local, "127.0.0.1:80");
+        assert_eq!(sock.remote, "0.0.0.0:8080");
+        assert_eq!(sock.state, "已建立");
+        assert_eq!(sock.tx_queue, 0x10);
+        assert_eq!(sock.rx_queue, 0x20);
+        assert_eq!(sock.retrans, 2);
+        assert_eq!(sock.inode, 4242);
     }
 }

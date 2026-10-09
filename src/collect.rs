@@ -24,6 +24,7 @@ fn capture_linux() -> Result<HostSample> {
     let loadavg = fs::read_to_string("/proc/loadavg")?;
     let diskstats = fs::read_to_string("/proc/diskstats").unwrap_or_default();
     let netdev = fs::read_to_string("/proc/net/dev").unwrap_or_default();
+    let softnet = fs::read_to_string("/proc/net/softnet_stat").unwrap_or_default();
     let kernel = fs::read_to_string("/proc/sys/kernel/osrelease")
         .map(|text| text.trim().to_string())
         .unwrap_or_else(|_| "unknown".into());
@@ -42,6 +43,7 @@ fn capture_linux() -> Result<HostSample> {
         psi_io: read_pressure("/proc/pressure/io"),
         disks: parse::parse_diskstats(&diskstats),
         nets: parse::parse_netdev(&netdev),
+        softnet: parse::parse_softnet(&softnet),
         cgroup: read_cgroup(&cgroup_text, &cgroup_path),
     })
 }

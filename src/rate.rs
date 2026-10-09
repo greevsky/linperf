@@ -31,6 +31,12 @@ pub struct NetRates {
     pub rx_bytes_per_sec: f64,
     pub tx_bytes_per_sec: f64,
     pub errs_per_sec: f64,
+    pub drop_per_sec: f64,
+    pub err_per_sec: f64,
+    pub fifo_per_sec: f64,
+    pub frame_per_sec: f64,
+    pub carrier_per_sec: f64,
+    pub colls_per_sec: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -62,6 +68,9 @@ pub struct Rates {
     pub psi_io: Option<Pressure>,
     pub disks: Vec<DiskRates>,
     pub nets: Vec<NetRates>,
+    pub softnet_dropped_per_sec: f64,
+    pub softnet_squeeze_per_sec: f64,
+    pub softnet_flow_per_sec: f64,
     pub cgroup: Option<CgroupRates>,
 }
 
@@ -91,6 +100,9 @@ pub fn between(prev: &HostSample, curr: &HostSample) -> Result<Rates> {
         psi_io: curr.psi_io,
         disks: disk_rates(&prev.disks, &curr.disks, interval_ms),
         nets: net_rates(&prev.nets, &curr.nets, interval_secs),
+        softnet_dropped_per_sec: per_sec(prev.softnet.dropped, curr.softnet.dropped, interval_secs),
+        softnet_squeeze_per_sec: per_sec(prev.softnet.squeezed, curr.softnet.squeezed, interval_secs),
+        softnet_flow_per_sec: per_sec(prev.softnet.flow_limit, curr.softnet.flow_limit, interval_secs),
         cgroup: cgroup_rates(prev.cgroup.as_ref(), curr.cgroup.as_ref(), interval_secs),
     })
 }
@@ -160,15 +172,24 @@ fn net_rates(prev: &[NetCounters], curr: &[NetCounters], interval_secs: f64) -> 
     curr.iter()
         .filter_map(|net| {
             let old = prev.iter().find(|item| item.name == net.name)?;
-            let errs = delta(old.rx_errs, net.rx_errs)
-                + delta(old.rx_drop, net.rx_drop)
-                + delta(old.tx_errs, net.tx_errs)
-                + delta(old.tx_drop, net.tx_drop);
+            let drop = delta(old.rx_drop, net.rx_drop) + delta(old.tx_drop, net.tx_drop);
+            let err = delta(old.rx_errs, net.rx_errs) + delta(old.tx_errs, net.tx_errs);
+            let fifo = delta(old.rx_fifo, net.rx_fifo) + delta(old.tx_fifo, net.tx_fifo);
+            let frame = delta(old.rx_frame, net.rx_frame);
+            let carrier = delta(old.tx_carrier, net.tx_carrier);
+            let colls = delta(old.tx_colls, net.tx_colls);
+            let rate = |count: u64| count as f64 / interval_secs;
             Some(NetRates {
                 name: net.name.clone(),
                 rx_bytes_per_sec: per_sec(old.rx_bytes, net.rx_bytes, interval_secs),
                 tx_bytes_per_sec: per_sec(old.tx_bytes, net.tx_bytes, interval_secs),
-                errs_per_sec: errs as f64 / interval_secs,
+                errs_per_sec: rate(drop + err + fifo + frame + carrier + colls),
+                drop_per_sec: rate(drop),
+                err_per_sec: rate(err),
+                fifo_per_sec: rate(fifo),
+                frame_per_sec: rate(frame),
+                carrier_per_sec: rate(carrier),
+                colls_per_sec: rate(colls),
             })
         })
         .collect()

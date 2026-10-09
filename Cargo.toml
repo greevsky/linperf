@@ -1,12 +1,14 @@
 [package]
-name = "linperf"
-version = "0.1.0"
+name = "linji"
+version = "0.3.0"
 edition = "2021"
-description = "Linux 单机综合性能分析"
+authors = ["lei <mr.greevsky@gmail.com>"]
+description = "我放在一台 Linux 上的综合工具：硬件、进程、容器、防火墙、网络、日志"
+repository = "https://github.com/greevsky/linperf"
 publish = false
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(linperf_ebpf)"] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(linji_ebpf)"] }
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
