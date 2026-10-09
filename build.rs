@@ -46,5 +46,5 @@ fn main() {
             panic!("编译 bpf/{name}.bpf.c 失败");
         }
     }
-    println!("cargo:rustc-cfg=linji_ebpf");
+    println!("cargo:rustc-cfg=linuxtui_ebpf");
 }

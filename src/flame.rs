@@ -17,7 +17,7 @@ pub fn render_folded(folded: &str, title: &str, out: &Path) -> Result<()> {
 }
 
 pub fn render_demo(out: &Path) -> Result<()> {
-    render_folded(demo::demo_folded(), "临机 off-CPU 演示", out)
+    render_folded(demo::demo_folded(), "linuxtui off-CPU 演示", out)
 }
 
 #[cfg(test)]
@@ -26,7 +26,7 @@ mod tests {
 
     #[test]
     fn demo_svg_contains_the_sleeping_frames() {
-        let path = std::env::temp_dir().join("linji-demo-flame.svg");
+        let path = std::env::temp_dir().join("linuxtui-demo-flame.svg");
         render_demo(&path).unwrap();
         let svg = fs::read_to_string(&path).unwrap();
         assert!(svg.contains("<svg"));

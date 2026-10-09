@@ -18,9 +18,9 @@ const PERF_EVENT_IOC_ENABLE: libc::c_ulong = 0x2400;
 const PERF_EVENT_IOC_SET_BPF: libc::c_ulong = 0x4004_2408;
 const PERF_FLAG_FD_CLOEXEC: libc::c_ulong = 8;
 
-#[cfg(linji_ebpf)]
+#[cfg(linuxtui_ebpf)]
 const ONCPU_OBJ: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/oncpu.bpf.o"));
-#[cfg(linji_ebpf)]
+#[cfg(linuxtui_ebpf)]
 const OFFCPU_OBJ: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/offcpu.bpf.o"));
 
 struct ElfProg {
@@ -42,18 +42,18 @@ struct MapDef {
 }
 
 pub fn embedded() -> bool {
-    cfg!(linji_ebpf)
+    cfg!(linuxtui_ebpf)
 }
 
 pub fn sample_folded(kind: &str, seconds: u64, pid: Option<i32>) -> Result<String> {
-    #[cfg(not(linji_ebpf))]
+    #[cfg(not(linuxtui_ebpf))]
     {
         let _ = (kind, seconds, pid);
         return Err(Error::Message(
             "这个构建还没有嵌入 eBPF 字节码。".into(),
         ));
     }
-    #[cfg(linji_ebpf)]
+    #[cfg(linuxtui_ebpf)]
     {
         let (bytes, prog_type) = match kind {
             "oncpu" => (ONCPU_OBJ, BPF_PROG_TYPE_PERF_EVENT),
@@ -371,7 +371,7 @@ fn load_program(prog: &ElfProg) -> Result<i32> {
         prog_name: [u8; 16],
     }
     let mut prog_name = [0u8; 16];
-    let name = b"linji";
+    let name = b"linuxtui";
     prog_name[..name.len()].copy_from_slice(name);
     let attr = Attr {
         prog_type: prog.prog_type,
@@ -795,7 +795,7 @@ mod tests {
 
     #[test]
     fn embedded_object_has_maps_and_license() {
-        if !cfg!(linji_ebpf) {
+        if !cfg!(linuxtui_ebpf) {
             return;
         }
         let bytes = include_bytes!(concat!(env!("OUT_DIR"), "/oncpu.bpf.o"));

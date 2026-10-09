@@ -1,5 +1,5 @@
 [package]
-name = "linji"
+name = "linuxtui"
 version = "0.3.0"
 edition = "2021"
 authors = ["lei <mr.greevsky@gmail.com>"]
@@ -8,7 +8,7 @@ repository = "https://github.com/greevsky/linperf"
 publish = false
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(linji_ebpf)"] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(linuxtui_ebpf)"] }
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

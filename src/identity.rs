@@ -1,5 +1,5 @@
-pub const PRODUCT: &str = "临机";
-pub const COMMAND: &str = "linji";
+pub const PRODUCT: &str = "linuxtui";
+pub const COMMAND: &str = "linuxtui";
 pub const AUTHOR: &str = "lei <mr.greevsky@gmail.com>";
 pub const REPOSITORY: &str = "https://github.com/greevsky/linperf";
 

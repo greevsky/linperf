@@ -294,7 +294,7 @@ pub fn detect() -> Result<HostCaps> {
             cap_bpf: false,
             cap_perfmon: false,
             cap_sys_admin: false,
-            ebpf_linked: cfg!(linji_ebpf),
+            ebpf_linked: cfg!(linuxtui_ebpf),
         })
     }
 }
@@ -346,7 +346,7 @@ fn detect_linux() -> HostCaps {
         cap_bpf: has_cap(eff, 39),
         cap_perfmon: has_cap(eff, 38),
         cap_sys_admin: has_cap(eff, 21),
-        ebpf_linked: cfg!(linji_ebpf),
+        ebpf_linked: cfg!(linuxtui_ebpf),
     }
 }
 

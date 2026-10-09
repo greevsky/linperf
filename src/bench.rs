@@ -357,7 +357,7 @@ fn tcp_serve_one(mut stream: TcpStream, stop: &AtomicBool, stats: &Mutex<Inner>)
         || header[0..4] != *MAGIC
         || header[4] != UPLOAD
     {
-        set_phase(stats, "收到的不是临机吞吐握手，继续等待");
+        set_phase(stats, "收到的不是 linuxtui 吞吐握手，继续等待");
         return;
     }
     let seconds = u16::from_be_bytes([header[6], header[7]]).clamp(1, 10);

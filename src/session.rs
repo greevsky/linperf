@@ -73,7 +73,7 @@ pub fn demo_len() -> usize {
 
 fn demo_host() -> HostCaps {
     HostCaps {
-        os: "临机演示".into(),
+        os: "linuxtui 演示".into(),
         kernel: "demo".into(),
         arch: std::env::consts::ARCH.into(),
         procfs: true,

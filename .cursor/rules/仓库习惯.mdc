@@ -5,7 +5,7 @@ alwaysApply: true
 
 # 仓库习惯
 
-我是 lei，邮箱 mr.greevsky@gmail.com。仓库是 https://github.com/greevsky/linperf 。工具对外叫临机，命令是 linji。GitHub 仓库名还没改成 linji 之前，工具里的地址继续用现在这个仓库。
+我是 lei，邮箱 mr.greevsky@gmail.com。仓库是 https://github.com/greevsky/linperf 。工具就叫 linuxtui，没有中文名。GitHub 仓库名还是 linperf 的时候，工具里的地址继续用这个仓库。
 
 提交说明用中文，用我的口吻写，说明我为什么改。例如：「我把导航上的日志入口提前，现场先看服务状态。」不要写成助手汇报。
 

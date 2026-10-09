@@ -719,7 +719,7 @@ fn journal_tail(unit: &str) -> std::result::Result<Vec<String>, String> {
 
 fn entry_banner() -> Banner {
     Banner {
-        title: "临机",
+        title: "linuxtui",
         lines: &[
             "欢迎",
             "硬件 · 进程 · 容器 · 防火墙 · 网络 · 日志",
@@ -738,7 +738,7 @@ fn section_banner(screen: Screen) -> Banner {
         Screen::Firewall => ("防火墙", &["欢迎", "过滤表、转发、连接跟踪"]),
         Screen::Network => ("网络", &["欢迎", "地址、路由、网卡、内核参数", "抓包、吞吐和 SSH"]),
         Screen::Syslog => ("日志", &["欢迎", "快捷操作、审计、系统服务，然后才是分类日志"]),
-        _ => ("临机", &["欢迎"]),
+        _ => ("linuxtui", &["欢迎"]),
     };
     Banner {
         title,
