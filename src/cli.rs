@@ -17,8 +17,8 @@ use crate::tui;
     name = "linuxtui",
     author,
     version,
-    about = "我放在这台 Linux 上的综合工具。直接运行进入导航：硬件、进程、容器、防火墙、网络、日志",
-    long_about = "linuxtui。我放在一台 Linux 上，打开先进入导航：硬件、进程、容器、防火墙、网络、日志。性能定位、等保基线、抓包和吞吐都在里面。\n版权所有 © 2026 lei <mr.greevsky@gmail.com>\nhttps://github.com/greevsky/linperf"
+    about = "我放在这台 Linux 上的综合工具。直接运行进入进程页，硬件在左上角，1 容器 2 防火墙 3 网络 4 日志",
+    long_about = "linuxtui。打开就是进程页。左上角是硬件，右边从 1 开始是容器、防火墙、网络、日志。性能定位、等保基线、抓包和吞吐都在里面。\n版权所有 © 2026 lei <mr.greevsky@gmail.com>\nhttps://github.com/greevsky/linperf"
 )]
 struct Cli {
     #[command(subcommand)]

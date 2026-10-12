@@ -6,6 +6,7 @@ mod board;
 mod cli;
 mod collect;
 mod compat;
+mod containers;
 mod demo;
 mod ebpf;
 mod error;

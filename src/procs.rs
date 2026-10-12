@@ -184,7 +184,7 @@ fn build(prev: &ProcShot, curr: &ProcShot, limit: usize, interesting_only: bool)
                 || !rate.cmdline.is_empty()
                 || rate.cpu_ratio > 0.02
                 || rate.read_bps + rate.write_bps > 100_000.0
-                || rate.state == "D"
+                || rate.state.starts_with('D')
                 || rate.vmswap_kb > 0;
             live.then_some(rate)
         })
@@ -333,7 +333,7 @@ pub fn describe_runtime(cgroup: &str, isolated: &[String]) -> (String, String) {
     (runtime, namespaces)
 }
 
-fn container_identity(cgroup: &str) -> Option<(&'static str, String)> {
+pub(crate) fn container_identity(cgroup: &str) -> Option<(&'static str, String)> {
     let lower = cgroup.to_ascii_lowercase();
     let kind = if lower.contains("kubepods") {
         "kubernetes"
@@ -372,82 +372,6 @@ fn hex_token(path: &str) -> Option<String> {
         }
     }
     found
-}
-
-#[derive(Debug, Clone)]
-pub struct ContainerGroup {
-    pub runtime: String,
-    pub id: String,
-    pub tasks: usize,
-    pub rss_kb: u64,
-    pub comms: String,
-}
-
-pub fn list_containers() -> Vec<ContainerGroup> {
-    let mut groups: HashMap<(String, String), (usize, u64, Vec<String>)> = HashMap::new();
-    let Ok(dir) = fs::read_dir("/proc") else {
-        return Vec::new();
-    };
-    let page_kb = page_kb();
-    for entry in dir.flatten() {
-        let pid = entry.file_name();
-        let pid = pid.to_string_lossy();
-        if !pid.chars().all(|ch| ch.is_ascii_digit()) {
-            continue;
-        }
-        let cgroup = fs::read_to_string(format!("/proc/{pid}/cgroup"))
-            .ok()
-            .and_then(|text| crate::parse::parse_cgroup_path(&text))
-            .unwrap_or_default();
-        let Some((runtime, id)) = container_identity(&cgroup) else {
-            continue;
-        };
-        let pages = fs::read_to_string(format!("/proc/{pid}/statm"))
-            .ok()
-            .and_then(|text| text.split_whitespace().nth(1)?.parse::<u64>().ok())
-            .unwrap_or(0);
-        let comm = fs::read_to_string(format!("/proc/{pid}/comm"))
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        let slot = groups.entry((runtime.to_string(), id)).or_default();
-        slot.0 += 1;
-        slot.1 += pages * page_kb;
-        if !comm.is_empty() && !slot.2.contains(&comm) && slot.2.len() < 4 {
-            slot.2.push(comm);
-        }
-    }
-    let mut rows: Vec<_> = groups
-        .into_iter()
-        .map(|((runtime, id), (tasks, rss_kb, comms))| ContainerGroup {
-            runtime,
-            id,
-            tasks,
-            rss_kb,
-            comms: comms.join("、"),
-        })
-        .collect();
-    rows.sort_by(|left, right| right.rss_kb.cmp(&left.rss_kb).then(left.id.cmp(&right.id)));
-    rows
-}
-
-pub fn demo_containers() -> Vec<ContainerGroup> {
-    vec![ContainerGroup {
-        runtime: "docker".into(),
-        id: "a247dff2ff6d".into(),
-        tasks: 21,
-        rss_kb: 133 * 1024,
-        comms: "minio".into(),
-    }]
-}
-
-fn page_kb() -> u64 {
-    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    if page > 0 {
-        page as u64 / 1024
-    } else {
-        4
-    }
 }
 
 fn isolated_namespaces(pid: i32) -> Vec<String> {
@@ -889,19 +813,43 @@ pub fn format_table(rows: &[ProcRate]) -> String {
 }
 
 pub fn state_label(state: &str) -> String {
-    match state {
-        "R" => "运行".into(),
-        "S" => "睡眠".into(),
-        "D" => "等IO".into(),
-        "T" | "t" => "停止".into(),
-        "Z" => "僵尸".into(),
-        "I" => "空闲".into(),
-        other => other.to_string(),
+    state.to_string()
+}
+
+fn ps_state(
+    state: &str,
+    pid: i32,
+    pgrp: i32,
+    session: i32,
+    tty_nr: i32,
+    tpgid: i32,
+    nice: i64,
+    threads: u64,
+    locked: bool,
+) -> String {
+    let mut out = state.to_string();
+    if nice < 0 {
+        out.push('<');
+    } else if nice > 0 {
+        out.push('N');
     }
+    if locked {
+        out.push('L');
+    }
+    if session != 0 && pid == session {
+        out.push('s');
+    }
+    if threads > 1 {
+        out.push('l');
+    }
+    if tty_nr > 0 && pgrp == tpgid {
+        out.push('+');
+    }
+    out
 }
 
 fn score(proc: &ProcRate) -> f64 {
-    let waiting = if proc.state == "D" { 0.8 } else { 0.0 };
+    let waiting = if proc.state.starts_with('D') { 0.8 } else { 0.0 };
     proc.cpu_ratio + proc.write_bps / 50_000_000.0 + proc.read_bps / 80_000_000.0 + waiting
 }
 
@@ -940,11 +888,26 @@ fn read_proc(pid: i32) -> Option<ProcPoint> {
         .and_then(|text| text.split_whitespace().next())
         .and_then(|text| text.parse().ok())
         .unwrap_or(0);
+    let threads = kv
+        .get("Threads")
+        .and_then(|text| text.parse().ok())
+        .unwrap_or_else(|| fields.get(17).and_then(|text| text.parse().ok()).unwrap_or(1));
+    let state = ps_state(
+        fields.first().map(String::as_str).unwrap_or(""),
+        parsed_pid,
+        fields.get(2).and_then(|text| text.parse().ok()).unwrap_or(0),
+        fields.get(3).and_then(|text| text.parse().ok()).unwrap_or(0),
+        fields.get(4).and_then(|text| text.parse().ok()).unwrap_or(0),
+        fields.get(5).and_then(|text| text.parse().ok()).unwrap_or(-1),
+        fields.get(16).and_then(|text| text.parse().ok()).unwrap_or(0),
+        threads,
+        kb_field(&kv, "VmLck").unwrap_or(0) > 0,
+    );
     Some(ProcPoint {
         pid: parsed_pid,
         comm,
         cmdline,
-        state: fields.first().cloned().unwrap_or_default(),
+        state,
         ppid: fields.get(1).and_then(|text| text.parse().ok()).unwrap_or(0),
         uid,
         utime: fields.get(11).and_then(|text| text.parse().ok()).unwrap_or(0),
@@ -952,10 +915,7 @@ fn read_proc(pid: i32) -> Option<ProcPoint> {
         rss_kb: kb_field(&kv, "VmRSS").unwrap_or(0),
         vmsize_kb: kb_field(&kv, "VmSize").unwrap_or(0),
         vmswap_kb: kb_field(&kv, "VmSwap").unwrap_or(0),
-        threads: kv
-            .get("Threads")
-            .and_then(|text| text.parse().ok())
-            .unwrap_or_else(|| fields.get(17).and_then(|text| text.parse().ok()).unwrap_or(1)),
+        threads,
         read_bytes: parse_io_counter(&io, "read_bytes:"),
         write_bytes: parse_io_counter(&io, "write_bytes:"),
         vol_ctxt: kv
@@ -1040,6 +1000,14 @@ mod tests {
         assert_eq!(fields[11], "10");
         assert_eq!(fields[12], "20");
         assert_eq!(fields[17], "3");
+    }
+
+    #[test]
+    fn ps_state_keeps_the_proc_letters() {
+        assert_eq!(ps_state("S", 1, 1, 1, 34816, 1, 0, 1, false), "Ss+");
+        assert_eq!(ps_state("D", 5, 5, 1, 0, -1, 0, 1, false), "D");
+        assert_eq!(ps_state("Z", 9, 9, 9, 0, -1, 0, 1, false), "Zs");
+        assert_eq!(ps_state("S", 2, 2, 2, 0, -1, -10, 4, false), "S<sl");
     }
 
     #[test]

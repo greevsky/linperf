@@ -23,7 +23,7 @@ pub fn action(finding: &Finding, procs: &[ProcRate]) -> Action {
 
 pub fn for_process(proc: &ProcRate, extra: Option<&ProcExtra>) -> String {
     let mut parts = Vec::new();
-    if proc.state == "D" {
+    if proc.state.starts_with('D') {
         let wchan = if proc.wchan.is_empty() {
             "未知等待点".into()
         } else {
@@ -61,7 +61,7 @@ pub fn for_process(proc: &ProcRate, extra: Option<&ProcExtra>) -> String {
                 ));
             }
         }
-        if extra.stack.is_none() && proc.state == "D" {
+        if extra.stack.is_none() && proc.state.starts_with('D') {
             parts.push("内核栈读不到。用 root 或 CAP_SYS_PTRACE 再看 /proc/<pid>/stack，才能从 wchan 走到具体函数。".into());
         }
     }
@@ -94,10 +94,10 @@ fn rank_key(id: &str, proc: &ProcRate) -> f64 {
     match id {
         "io.saturated" | "cpu.iowait" => {
             let bytes = proc.write_bps + proc.read_bps;
-            if proc.state != "D" && bytes < 1_000_000.0 {
+            if !proc.state.starts_with('D') && bytes < 1_000_000.0 {
                 return 0.0;
             }
-            let waiting = if proc.state == "D" { 1.0 } else { 0.0 };
+            let waiting = if proc.state.starts_with('D') { 1.0 } else { 0.0 };
             bytes / 1_000_000.0 + waiting
         }
         "cpu.saturated" | "cgroup.cpu_throttle" => {

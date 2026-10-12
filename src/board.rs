@@ -60,9 +60,14 @@ pub struct FirewallView {
 #[derive(Debug, Clone)]
 pub struct HwDisk {
     pub name: String,
+    #[allow(dead_code)]
     pub size: String,
+    pub bytes: u64,
+    #[allow(dead_code)]
     pub model: String,
+    #[allow(dead_code)]
     pub serial: String,
+    #[allow(dead_code)]
     pub kind: String,
 }
 
@@ -70,12 +75,17 @@ pub struct HwDisk {
 pub struct HardwareInfo {
     pub vendor: String,
     pub product: String,
+    #[allow(dead_code)]
     pub version: String,
     pub serial: String,
+    #[allow(dead_code)]
     pub uuid: String,
+    #[allow(dead_code)]
     pub bios: String,
+    #[allow(dead_code)]
     pub board: String,
     pub cpu: String,
+    #[allow(dead_code)]
     pub memory: String,
     pub disks: Vec<HwDisk>,
 }
@@ -103,6 +113,7 @@ impl FirewallView {
 }
 
 impl HardwareInfo {
+    #[allow(dead_code)]
     pub fn empty() -> Self {
         Self {
             vendor: String::new(),
@@ -263,13 +274,24 @@ pub fn demo_hardware() -> HardwareInfo {
         board: "演示主板".into(),
         cpu: "演示处理器  4 线程  每槽 4 核".into(),
         memory: "8.0 GiB".into(),
-        disks: vec![HwDisk {
-            name: "sda".into(),
-            size: "100 GiB".into(),
-            model: "DEMO DISK".into(),
-            serial: "DISKSN".into(),
-            kind: "固态".into(),
-        }],
+        disks: vec![
+            HwDisk {
+                name: "vda".into(),
+                size: "100.0GiB".into(),
+                bytes: 100 * 1024 * 1024 * 1024u64,
+                model: "DEMO DISK".into(),
+                serial: "DISKSN".into(),
+                kind: "虚拟".into(),
+            },
+            HwDisk {
+                name: "vdb".into(),
+                size: "500.0GiB".into(),
+                bytes: 500 * 1024 * 1024 * 1024u64,
+                model: "DEMO DISK".into(),
+                serial: "DISKSN2".into(),
+                kind: "虚拟".into(),
+            },
+        ],
     }
 }
 
@@ -837,7 +859,7 @@ fn read_disks() -> Vec<HwDisk> {
             continue;
         }
         let base = format!("/sys/block/{name}");
-        let sectors = read_text(&format!("{base}/size")).parse().unwrap_or(0);
+        let sectors: u64 = read_text(&format!("{base}/size")).parse().unwrap_or(0);
         let model = fallback(&read_text(&format!("{base}/device/model")), "");
         let serial = fallback(&read_text(&format!("{base}/device/serial")), "");
         let vendor = read_text(&format!("{base}/device/vendor"));
@@ -853,6 +875,7 @@ fn read_disks() -> Vec<HwDisk> {
         rows.push(HwDisk {
             name,
             size: human_sectors(sectors),
+            bytes: sectors.saturating_mul(512),
             model: if model.is_empty() { "读不到".into() } else { model },
             serial: if serial.is_empty() { "读不到".into() } else { serial },
             kind: kind.into(),

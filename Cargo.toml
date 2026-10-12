@@ -3,7 +3,7 @@ name = "linuxtui"
 version = "0.3.0"
 edition = "2021"
 authors = ["lei <mr.greevsky@gmail.com>"]
-description = "我放在一台 Linux 上的综合工具：硬件、进程、容器、防火墙、网络、日志"
+description = "我放在一台 Linux 上的综合工具。打开就是进程页，硬件在左上角"
 repository = "https://github.com/greevsky/linperf"
 publish = false
 

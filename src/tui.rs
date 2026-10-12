@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::io::{self, IsTerminal, Stdout, Write};
+use std::io::{self, IsTerminal, Stdout};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -13,7 +13,7 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, Cell, HighlightSpacing, Paragraph, Row, Table, TableState, Wrap,
+    Block, Borders, Cell, HighlightSpacing, Paragraph, Row, Table, TableState,
 };
 use ratatui::{Frame, Terminal};
 
@@ -25,6 +25,7 @@ use crate::sniff;
 use crate::syslog;
 use crate::collect;
 use crate::compat;
+use crate::containers;
 use crate::error::{Error, Result};
 use crate::model::HostSample;
 use crate::procs::{self, ProcExtra, ProcRate, ProcShot};
@@ -43,8 +44,6 @@ enum SortKey {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Screen {
-    Nav,
-    Hardware,
     Procs,
     Process,
     Logs,
@@ -69,14 +68,6 @@ enum NetFocus {
     Capture,
     Ssh,
     Bench,
-}
-
-#[derive(Clone, Copy)]
-struct Banner {
-    title: &'static str,
-    lines: &'static [&'static str],
-    until: Instant,
-    next: Screen,
 }
 
 #[derive(Clone)]
@@ -106,11 +97,10 @@ struct App {
     filtering: bool,
     filter: String,
     screen: Screen,
-    banner: Option<Banner>,
-    nav_cursor: usize,
     board_scroll: usize,
-    virt: String,
-    containers: Vec<procs::ContainerGroup>,
+    inventory: containers::Inventory,
+    container_picks: Vec<Option<containers::Pick>>,
+    container_place: bool,
     firewall: board::FirewallView,
     net: board::NetConfig,
     net_focus: NetFocus,
@@ -130,12 +120,15 @@ struct App {
     packet_scroll: usize,
     board_cursor: usize,
     board_rows: Vec<String>,
-    pending_copy: Option<String>,
-    last_copied: String,
-    copy_hint: String,
+    box_cursor: usize,
+    box_scroll: usize,
+    syslog_anchor: Option<usize>,
+    capture_from_ifaces: bool,
     hardware: board::HardwareInfo,
     box_output: bool,
     box_exec: bool,
+    box_action: Option<ContainerAction>,
+    box_pick: Option<containers::Pick>,
     box_title: String,
     box_lines: Vec<String>,
     iface_cursor: usize,
@@ -163,6 +156,7 @@ struct App {
     log_lines: Vec<String>,
     log_note: String,
     log_from_bottom: usize,
+    log_follow: bool,
     process_scroll: usize,
     iface_prev: Option<IfacePrev>,
     status: String,
@@ -206,18 +200,11 @@ pub fn run(interval_secs: u64, demo: bool) -> Result<()> {
         descending: true,
         filtering: false,
         filter: String::new(),
-        screen: Screen::Nav,
-        banner: Some(entry_banner()),
-        nav_cursor: 0,
+        screen: Screen::Procs,
         board_scroll: 0,
-        virt: if demo {
-            "演示".into()
-        } else {
-            compat::detect()
-                .map(|caps| caps.virt)
-                .unwrap_or_else(|_| "未知".into())
-        },
-        containers: Vec::new(),
+        inventory: containers::Inventory::empty(""),
+        container_picks: Vec::new(),
+        container_place: false,
         firewall: board::FirewallView::empty(),
         net: board::NetConfig::empty(),
         net_focus: NetFocus::Config,
@@ -237,16 +224,19 @@ pub fn run(interval_secs: u64, demo: bool) -> Result<()> {
         packet_scroll: 0,
         board_cursor: 0,
         board_rows: Vec::new(),
-        pending_copy: None,
-        last_copied: String::new(),
-        copy_hint: String::new(),
+        box_cursor: 0,
+        box_scroll: 0,
+        syslog_anchor: None,
+        capture_from_ifaces: false,
         hardware: if demo {
             board::demo_hardware()
         } else {
-            board::HardwareInfo::empty()
+            board::load_hardware()
         },
         box_output: false,
         box_exec: false,
+        box_action: None,
+        box_pick: None,
         box_title: String::new(),
         box_lines: Vec::new(),
         iface_cursor: 0,
@@ -274,6 +264,7 @@ pub fn run(interval_secs: u64, demo: bool) -> Result<()> {
         log_lines: Vec::new(),
         log_note: String::new(),
         log_from_bottom: 0,
+        log_follow: true,
         process_scroll: 0,
         iface_prev: None,
         status: if demo {
@@ -304,13 +295,11 @@ fn event_loop(
 ) -> Result<()> {
     let interval = Duration::from_secs(interval_secs);
     loop {
-        expire_banner(app);
         if app.full_clear {
             terminal.clear()?;
             app.full_clear = false;
         }
         terminal.draw(|frame| draw(frame, app))?;
-        flush_copy(app);
         if event::poll(next_timeout(app, interval))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Release {
@@ -338,10 +327,6 @@ fn event_loop(
 }
 
 fn next_timeout(app: &App, interval: Duration) -> Duration {
-    if let Some(banner) = app.banner {
-        let rest = banner.until.saturating_duration_since(Instant::now());
-        return rest.min(Duration::from_millis(40)).max(Duration::from_millis(16));
-    }
     if app.capture.is_open() || app.bench.snap().running {
         return Duration::from_millis(40);
     }
@@ -353,13 +338,6 @@ fn next_timeout(app: &App, interval: Duration) -> Duration {
 fn on_key(app: &mut App, key: KeyEvent) -> bool {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return true;
-    }
-    if app.banner.is_some() {
-        if key.code == KeyCode::Char('q') {
-            return true;
-        }
-        dismiss_banner(app, Some(key));
-        return false;
     }
     if key.code == KeyCode::Char('?') {
         app.help = !app.help;
@@ -375,8 +353,7 @@ fn on_key(app: &mut App, key: KeyEvent) -> bool {
         return on_filter_key(app, key);
     }
     match app.screen {
-        Screen::Nav => on_nav_key(app, key),
-        Screen::Hardware | Screen::Firewall => on_scroll_key(app, key),
+        Screen::Firewall => on_scroll_key(app, key),
         Screen::Containers => on_container_key(app, key),
         Screen::Procs => on_home_key(app, key),
         Screen::Process => on_process_key(app, key),
@@ -430,6 +407,7 @@ fn on_home_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char('G') => move_cursor_to(app, &visible, len.saturating_sub(1)),
         KeyCode::Enter => {
             if let Some(proc) = visible.get(app.cursor) {
+                app.home_pid = Some(proc.pid);
                 app.focus_pid = Some(proc.pid);
                 app.screen = Screen::Process;
                 app.process_scroll = 0;
@@ -441,10 +419,12 @@ fn on_home_key(app: &mut App, key: KeyEvent) -> bool {
                 app.filter.clear();
                 app.cursor = 0;
                 app.home_pid = None;
-            } else {
-                return_to_nav(app);
             }
         }
+        KeyCode::Char('1') => open_section(app, Screen::Containers),
+        KeyCode::Char('2') => open_section(app, Screen::Firewall),
+        KeyCode::Char('3') => open_section(app, Screen::Network),
+        KeyCode::Char('4') => open_section(app, Screen::Syslog),
         KeyCode::Char('/') => app.filtering = true,
         KeyCode::Char('c') => toggle_sort(app, SortKey::Cpu),
         KeyCode::Char('m') => toggle_sort(app, SortKey::Mem),
@@ -462,12 +442,14 @@ fn on_process_key(app: &mut App, key: KeyEvent) -> bool {
     match key.code {
         KeyCode::Char('q') => true,
         KeyCode::Esc => {
+            app.home_pid = app.focus_pid.or(app.home_pid);
             app.screen = Screen::Procs;
             false
         }
         KeyCode::Char('l') => {
             app.screen = Screen::Logs;
             app.log_from_bottom = 0;
+            app.log_follow = true;
             refresh_logs(app);
             false
         }
@@ -509,26 +491,32 @@ fn on_log_key(app: &mut App, key: KeyEvent) -> bool {
         }
         KeyCode::Char('j') | KeyCode::Down => {
             app.log_from_bottom = app.log_from_bottom.saturating_sub(1);
+            app.log_follow = app.log_from_bottom == 0;
             false
         }
         KeyCode::Char('k') | KeyCode::Up => {
             app.log_from_bottom = app.log_from_bottom.saturating_add(1);
+            app.log_follow = false;
             false
         }
         KeyCode::Char('g') => {
             app.log_from_bottom = usize::MAX / 4;
+            app.log_follow = false;
             false
         }
         KeyCode::Char('G') => {
             app.log_from_bottom = 0;
+            app.log_follow = true;
             false
         }
         KeyCode::PageDown => {
             app.log_from_bottom = app.log_from_bottom.saturating_sub(page);
+            app.log_follow = app.log_from_bottom == 0;
             false
         }
         KeyCode::PageUp => {
             app.log_from_bottom = app.log_from_bottom.saturating_add(page);
+            app.log_follow = false;
             false
         }
         _ => false,
@@ -699,6 +687,8 @@ fn journal_tail(unit: &str) -> std::result::Result<Vec<String>, String> {
             "short-iso",
             "--quiet",
         ])
+        .env("SYSTEMD_COLORS", "0")
+        .env("TERM", "dumb")
         .output()
         .map_err(|err| format!("无法运行 journalctl: {err}"))?;
     if !output.status.success() {
@@ -710,65 +700,11 @@ fn journal_tail(unit: &str) -> std::result::Result<Vec<String>, String> {
         return Err(err.to_string());
     }
     let text = String::from_utf8_lossy(&output.stdout);
-    let lines: Vec<_> = text.lines().map(|line| line.to_string()).collect();
+    let lines: Vec<_> = text.lines().map(board::plain_line).filter(|line| !line.is_empty()).collect();
     if lines.is_empty() {
         return Err(format!("{unit} 暂时没有日志"));
     }
     Ok(lines)
-}
-
-fn entry_banner() -> Banner {
-    Banner {
-        title: "linuxtui",
-        lines: &[
-            "欢迎",
-            "硬件 · 进程 · 容器 · 防火墙 · 网络 · 日志",
-            "版权所有 © 2026 lei",
-        ],
-        until: Instant::now() + Duration::from_millis(700),
-        next: Screen::Nav,
-    }
-}
-
-fn section_banner(screen: Screen) -> Banner {
-    let (title, lines): (&str, &[&str]) = match screen {
-        Screen::Hardware => ("硬件", &["欢迎", "主机、CPU、内存、磁盘、网卡"]),
-        Screen::Procs => ("进程", &["欢迎", "进程表、资源下钻、日志"]),
-        Screen::Containers => ("容器", &["欢迎", "docker、containerd、kubernetes、podman"]),
-        Screen::Firewall => ("防火墙", &["欢迎", "过滤表、转发、连接跟踪"]),
-        Screen::Network => ("网络", &["欢迎", "地址、路由、网卡、内核参数", "抓包、吞吐和 SSH"]),
-        Screen::Syslog => ("日志", &["欢迎", "快捷操作、审计、系统服务，然后才是分类日志"]),
-        _ => ("linuxtui", &["欢迎"]),
-    };
-    Banner {
-        title,
-        lines,
-        until: Instant::now() + Duration::from_millis(450),
-        next: screen,
-    }
-}
-
-fn expire_banner(app: &mut App) {
-    if app.banner.is_some_and(|banner| Instant::now() >= banner.until) {
-        dismiss_banner(app, None);
-    }
-}
-
-fn dismiss_banner(app: &mut App, key: Option<KeyEvent>) {
-    let Some(banner) = app.banner.take() else {
-        return;
-    };
-    app.screen = banner.next;
-    prepare_screen(app);
-    if banner.next == Screen::Nav {
-        if let Some(key) = key {
-            if let KeyCode::Char(ch) = key.code {
-                if let Some(screen) = section_by_digit(ch) {
-                    open_section(app, screen);
-                }
-            }
-        }
-    }
 }
 
 fn open_section(app: &mut App, screen: Screen) {
@@ -779,20 +715,22 @@ fn open_section(app: &mut App, screen: Screen) {
     app.board_scroll = 0;
     app.board_cursor = 0;
     app.box_output = false;
-    app.banner = Some(section_banner(screen));
+    app.screen = screen;
+    prepare_screen(app);
 }
 
 fn prepare_screen(app: &mut App) {
     match app.screen {
         Screen::Containers => {
-            app.containers = if app.demo {
-                procs::demo_containers()
+            app.inventory = if app.demo {
+                containers::demo()
             } else {
-                procs::list_containers()
+                containers::load()
             };
-            if !app.containers.is_empty() {
-                app.board_cursor = 1;
-            }
+            app.container_place = true;
+            app.box_output = false;
+            app.box_action = None;
+            app.box_pick = None;
         }
         Screen::Firewall => {
             app.firewall = if app.demo {
@@ -808,75 +746,18 @@ fn prepare_screen(app: &mut App) {
                 board::load_net()
             };
         }
-        Screen::Hardware => {
-            app.hardware = if app.demo {
-                board::demo_hardware()
-            } else {
-                board::load_hardware()
-            };
-        }
         Screen::Syslog => load_syslog(app, true),
         _ => {}
     }
 }
 
-fn return_to_nav(app: &mut App) {
+fn return_to_procs(app: &mut App) {
     stop_capture(app);
     app.bench.stop();
     app.full_clear = true;
     app.net_focus = NetFocus::Config;
-    app.screen = Screen::Nav;
+    app.screen = Screen::Procs;
     app.board_scroll = 0;
-}
-
-fn section_by_digit(ch: char) -> Option<Screen> {
-    match ch {
-        '1' => Some(Screen::Hardware),
-        '2' => Some(Screen::Procs),
-        '3' => Some(Screen::Containers),
-        '4' => Some(Screen::Firewall),
-        '5' => Some(Screen::Network),
-        '6' => Some(Screen::Syslog),
-        _ => None,
-    }
-}
-
-fn sections() -> [Screen; 6] {
-    [
-        Screen::Hardware,
-        Screen::Procs,
-        Screen::Containers,
-        Screen::Firewall,
-        Screen::Network,
-        Screen::Syslog,
-    ]
-}
-
-fn on_nav_key(app: &mut App, key: KeyEvent) -> bool {
-    let items = sections();
-    match key.code {
-        KeyCode::Char('q') => true,
-        KeyCode::Char('j') | KeyCode::Down => {
-            app.nav_cursor = (app.nav_cursor + 1).min(items.len() - 1);
-            false
-        }
-        KeyCode::Char('k') | KeyCode::Up => {
-            app.nav_cursor = app.nav_cursor.saturating_sub(1);
-            false
-        }
-        KeyCode::Enter => {
-            open_section(app, items[app.nav_cursor]);
-            false
-        }
-        KeyCode::Char(ch) => {
-            if let Some(screen) = section_by_digit(ch) {
-                app.nav_cursor = sections().iter().position(|item| *item == screen).unwrap_or(0);
-                open_section(app, screen);
-            }
-            false
-        }
-        _ => false,
-    }
 }
 
 fn on_scroll_key(app: &mut App, key: KeyEvent) -> bool {
@@ -885,7 +766,7 @@ fn on_scroll_key(app: &mut App, key: KeyEvent) -> bool {
     match key.code {
         KeyCode::Char('q') => true,
         KeyCode::Esc => {
-            return_to_nav(app);
+            return_to_procs(app);
             false
         }
         KeyCode::Char('j') | KeyCode::Down => {
@@ -922,15 +803,34 @@ fn on_container_key(app: &mut App, key: KeyEvent) -> bool {
             KeyCode::Char('q') => true,
             KeyCode::Esc => {
                 app.box_output = false;
+                app.box_action = None;
                 false
             }
-            _ => on_scroll_key_stay(app, key),
+            KeyCode::Char('G') => {
+                app.log_follow = true;
+                app.box_cursor = usize::MAX;
+                false
+            }
+            KeyCode::Char('g') => {
+                app.log_follow = false;
+                app.box_cursor = 0;
+                false
+            }
+            _ => {
+                let page = app.page_rows.max(1);
+                let last = app.board_rows.len().saturating_sub(1);
+                nudge_cursor(&mut app.box_cursor, &key, last, page);
+                if app.box_action == Some(ContainerAction::Logs) {
+                    app.log_follow = app.box_cursor >= last;
+                }
+                false
+            }
         };
     }
     match key.code {
         KeyCode::Char('q') => true,
         KeyCode::Esc => {
-            return_to_nav(app);
+            return_to_procs(app);
             false
         }
         KeyCode::Char('l') => {
@@ -960,16 +860,20 @@ fn on_container_key(app: &mut App, key: KeyEvent) -> bool {
 fn on_scroll_key_stay(app: &mut App, key: KeyEvent) -> bool {
     let page = app.page_rows.max(1);
     let last = app.board_rows.len().saturating_sub(1);
+    nudge_cursor(&mut app.board_cursor, &key, last, page);
+    false
+}
+
+fn nudge_cursor(cursor: &mut usize, key: &KeyEvent, last: usize, page: usize) {
     match key.code {
-        KeyCode::Char('j') | KeyCode::Down => app.board_cursor = (app.board_cursor + 1).min(last),
-        KeyCode::Char('k') | KeyCode::Up => app.board_cursor = app.board_cursor.saturating_sub(1),
-        KeyCode::PageDown => app.board_cursor = (app.board_cursor + page).min(last),
-        KeyCode::PageUp => app.board_cursor = app.board_cursor.saturating_sub(page),
-        KeyCode::Char('g') => app.board_cursor = 0,
-        KeyCode::Char('G') => app.board_cursor = last,
+        KeyCode::Char('j') | KeyCode::Down => *cursor = (*cursor + 1).min(last),
+        KeyCode::Char('k') | KeyCode::Up => *cursor = cursor.saturating_sub(1),
+        KeyCode::PageDown => *cursor = (*cursor + page).min(last),
+        KeyCode::PageUp => *cursor = cursor.saturating_sub(page),
+        KeyCode::Char('g') => *cursor = 0,
+        KeyCode::Char('G') => *cursor = last,
         _ => {}
     }
-    false
 }
 
 fn on_net_key(app: &mut App, key: KeyEvent) -> bool {
@@ -983,6 +887,7 @@ fn on_net_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char('1') => {
             stop_capture(app);
             app.bench.stop();
+            app.capture_from_ifaces = false;
             app.net_focus = NetFocus::Config;
             app.board_scroll = 0;
             return false;
@@ -1119,6 +1024,7 @@ fn on_iface_key(app: &mut App, key: KeyEvent) -> bool {
             false
         }
         KeyCode::Char('a') => {
+            app.capture_from_ifaces = true;
             start_capture(app, None);
             false
         }
@@ -1128,6 +1034,7 @@ fn on_iface_key(app: &mut App, key: KeyEvent) -> bool {
             } else {
                 app.net.nics.get(app.iface_cursor - 1).map(|nic| nic.name.clone())
             };
+            app.capture_from_ifaces = true;
             start_capture(app, name);
             false
         }
@@ -1153,10 +1060,16 @@ fn on_capture_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Esc => {
             if app.cap_detail {
                 app.cap_detail = false;
+                app.packet_follow = false;
                 return false;
             }
             stop_capture(app);
-            app.net_focus = NetFocus::Config;
+            if app.capture_from_ifaces {
+                app.capture_from_ifaces = false;
+                app.net_focus = NetFocus::Ifaces;
+            } else {
+                app.net_focus = NetFocus::Config;
+            }
             false
         }
         KeyCode::Char('/') => {
@@ -1436,11 +1349,12 @@ fn shown_packet(text: String, view: sniff::PacketView) -> ShownPacket {
 fn refresh_boards(app: &mut App) {
     match app.screen {
         Screen::Containers => {
-            app.containers = if app.demo {
-                procs::demo_containers()
+            app.inventory = if app.demo {
+                containers::demo()
             } else {
-                procs::list_containers()
+                containers::load()
             };
+            refresh_container_logs(app);
         }
         Screen::Firewall => {
             app.firewall = if app.demo {
@@ -1454,13 +1368,6 @@ fn refresh_boards(app: &mut App) {
                 board::demo_net()
             } else {
                 board::load_net()
-            };
-        }
-        Screen::Hardware => {
-            app.hardware = if app.demo {
-                board::demo_hardware()
-            } else {
-                board::load_hardware()
             };
         }
         Screen::Syslog => load_syslog(app, false),
@@ -1484,9 +1391,29 @@ fn load_syslog(app: &mut App, place: bool) {
     app.syslog_source = view.source;
     app.syslog_lines = view.lines;
     if place {
-        app.board_cursor = 2;
-        app.board_scroll = 0;
+        if syslog_stream(app) {
+            app.log_follow = true;
+            app.board_cursor = usize::MAX;
+        } else {
+            app.board_cursor = 2;
+            app.board_scroll = 0;
+        }
     }
+}
+
+fn syslog_stream(app: &App) -> bool {
+    if !app.syslog_unit.is_empty() {
+        return true;
+    }
+    matches!(
+        syslog::LogKind::from_index(app.syslog_kind),
+        syslog::LogKind::Audit
+            | syslog::LogKind::Kernel
+            | syslog::LogKind::System
+            | syslog::LogKind::Auth
+            | syslog::LogKind::Service
+            | syslog::LogKind::Cron
+    )
 }
 
 fn drain_capture(app: &mut App) {
@@ -1546,58 +1473,134 @@ fn ssh_target(host: &str, port: &str) -> std::result::Result<(String, String), S
 }
 
 fn run_container_action(app: &mut App, action: ContainerAction) {
-    let Some(group) = selected_container(app).cloned() else {
+    let Some(pick) = selected_pick(app).cloned() else {
         app.box_title = "容器".into();
-        app.box_lines = vec!["没有选中容器".into()];
+        app.box_lines = vec!["没有选中这一行".into()];
         app.box_output = true;
-        app.board_cursor = 0;
+        app.box_action = None;
+        reset_box_view(app);
         return;
     };
-    app.board_cursor = 0;
-    app.box_output = true;
-    if app.demo {
-        app.box_title = format!("{} {}", action_name(action), group.id);
-        app.box_lines = vec![format!(
-            "演示：{} {} {}",
-            action_name(action),
-            group.runtime,
-            group.id
-        )];
+    if !action_applies(&pick, action) {
+        app.box_title = action_name(action).into();
+        app.box_lines = vec![action_reject(&pick, action)];
+        app.box_output = true;
+        app.box_action = None;
+        reset_box_view(app);
         return;
     }
-    match container_output(&group, action) {
+    reset_box_view(app);
+    app.box_output = true;
+    app.box_action = Some(action);
+    app.box_pick = Some(pick.clone());
+    if action == ContainerAction::Logs {
+        app.log_follow = true;
+    }
+    if app.demo {
+        app.box_title = format!("{} {}", action_name(action), pick_label(&pick));
+        app.box_lines = vec![format!("演示：{} {}", action_name(action), pick_label(&pick))];
+        return;
+    }
+    match container_output(&app.inventory.tool, &pick, action) {
         Ok((title, lines)) => {
             app.box_title = title;
             app.box_lines = lines;
         }
         Err(err) => {
-            app.box_title = group.id;
+            app.box_title = pick_label(&pick);
             app.box_lines = vec![err];
         }
     }
 }
 
+fn refresh_container_logs(app: &mut App) {
+    if !app.box_output || app.box_action != Some(ContainerAction::Logs) {
+        return;
+    }
+    let Some(pick) = app.box_pick.clone() else {
+        return;
+    };
+    if app.demo {
+        app.box_lines.push(format!("演示  跟踪  {}", app.demo_index));
+        if app.box_lines.len() > 200 {
+            let extra = app.box_lines.len() - 200;
+            app.box_lines.drain(0..extra);
+        }
+        return;
+    }
+    match container_output(&app.inventory.tool, &pick, ContainerAction::Logs) {
+        Ok((title, lines)) => {
+            app.box_title = title;
+            app.box_lines = lines;
+        }
+        Err(err) => app.box_lines = vec![err],
+    }
+}
+
+fn action_applies(pick: &containers::Pick, action: ContainerAction) -> bool {
+    match pick {
+        containers::Pick::Container { .. } => true,
+        _ => action == ContainerAction::Inspect,
+    }
+}
+
+fn action_reject(pick: &containers::Pick, action: ContainerAction) -> String {
+    let kind = match pick {
+        containers::Pick::Volume { .. } => "存储卷",
+        containers::Pick::Network { .. } => "网络",
+        containers::Pick::Image { .. } => "镜像",
+        containers::Pick::Container { .. } => "容器",
+    };
+    format!("{kind}不能{}", action_name(action))
+}
+
+fn pick_label(pick: &containers::Pick) -> String {
+    match pick {
+        containers::Pick::Container { id } => id.clone(),
+        containers::Pick::Volume { name }
+        | containers::Pick::Network { name }
+        | containers::Pick::Image { name } => name.clone(),
+    }
+}
+
+fn reset_box_view(app: &mut App) {
+    app.box_cursor = 0;
+    app.box_scroll = 0;
+}
+
+fn selected_pick(app: &App) -> Option<&containers::Pick> {
+    app.container_picks.get(app.board_cursor)?.as_ref()
+}
+
 fn launch_container_exec(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
-    let Some(group) = selected_container(app).cloned() else {
-        app.box_title = "容器".into();
+    let Some(pick) = selected_pick(app).cloned() else {
+        app.box_title = "进入".into();
         app.box_lines = vec!["没有选中容器".into()];
         app.box_output = true;
         return Ok(());
     };
+    let containers::Pick::Container { id } = &pick else {
+        app.box_title = "进入".into();
+        app.box_lines = vec!["只有容器可以进入".into()];
+        app.box_output = true;
+        reset_box_view(app);
+        return Ok(());
+    };
+    let id = id.clone();
     if app.demo {
         app.box_title = "进入".into();
         app.box_lines = vec!["演示模式不会进入容器。".into()];
         app.box_output = true;
-        app.board_cursor = 0;
+        reset_box_view(app);
         return Ok(());
     }
-    let (bin, args) = match exec_args(&group) {
+    let (bin, args) = match exec_args(&app.inventory.tool, &id) {
         Ok(cmd) => cmd,
         Err(err) => {
             app.box_title = "进入".into();
             app.box_lines = vec![err];
             app.box_output = true;
-            app.board_cursor = 0;
+            reset_box_view(app);
             return Ok(());
         }
     };
@@ -1608,8 +1611,8 @@ fn launch_container_exec(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app:
     execute!(io::stdout(), EnterAlternateScreen)?;
     terminal.clear()?;
     app.box_output = true;
-    app.board_cursor = 0;
-    app.box_title = format!("进入 {}", group.id);
+    reset_box_view(app);
+    app.box_title = format!("进入 {id}");
     app.box_lines = vec![match status {
         Ok(status) if status.success() => "已经从容器里返回".into(),
         Ok(status) => format!("退出码 {}", status.code().unwrap_or(-1)),
@@ -1618,26 +1621,20 @@ fn launch_container_exec(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app:
     Ok(())
 }
 
-fn container_output(group: &procs::ContainerGroup, action: ContainerAction) -> std::result::Result<(String, Vec<String>), String> {
-    if !safe_container_id(&group.id) {
-        return Err("容器 ID 不能交给命令行".into());
+fn container_output(
+    tool: &str,
+    pick: &containers::Pick,
+    action: ContainerAction,
+) -> std::result::Result<(String, Vec<String>), String> {
+    if tool.is_empty() {
+        return Err("没有容器命令，不能执行这一步".into());
     }
-    let bin = container_bin(&group.runtime)?;
-    let args = match (bin.as_str(), action) {
-        ("crictl", ContainerAction::Logs) => vec!["logs".into(), "--tail".into(), "200".into(), group.id.clone()],
-        ("crictl", ContainerAction::Inspect) => vec!["inspect".into(), group.id.clone()],
-        ("crictl", ContainerAction::Top) => vec!["inspect".into(), "--output".into(), "go-template".into(), group.id.clone()],
-        ("crictl", ContainerAction::Stats) => vec!["stats".into(), group.id.clone()],
-        (_, ContainerAction::Logs) => vec!["logs".into(), "--tail".into(), "200".into(), group.id.clone()],
-        (_, ContainerAction::Inspect) => vec!["inspect".into(), group.id.clone()],
-        (_, ContainerAction::Top) => vec!["top".into(), group.id.clone()],
-        (_, ContainerAction::Stats) => vec!["stats".into(), "--no-stream".into(), group.id.clone()],
-    };
-    let title = format!("{} {} {}", bin, action_name(action), group.id);
-    let output = Command::new(&bin)
+    let args = action_args(tool, pick, action)?;
+    let title = format!("{tool} {} {}", action_name(action), pick_label(pick));
+    let output = Command::new(tool)
         .args(&args)
         .output()
-        .map_err(|err| format!("无法运行 {bin}: {err}"))?;
+        .map_err(|err| format!("无法运行 {tool}: {err}"))?;
     let mut text = String::from_utf8_lossy(&output.stdout).to_string();
     if text.trim().is_empty() {
         text = String::from_utf8_lossy(&output.stderr).to_string();
@@ -1647,11 +1644,13 @@ fn container_output(group: &procs::ContainerGroup, action: ContainerAction) -> s
             text = serde_json::to_string_pretty(&value).unwrap_or(text);
         }
     }
-    let mut lines: Vec<String> = text.lines().map(|line| line.to_string()).collect();
+    let mut lines: Vec<String> = text.lines().map(board::plain_line).filter(|line| !line.is_empty()).collect();
     if lines.is_empty() {
         lines.push("命令没有输出".into());
     }
-    if lines.len() > 400 {
+    if matches!(action, ContainerAction::Logs) {
+        lines = keep_tail(lines, 200);
+    } else if lines.len() > 400 {
         let extra = lines.len() - 400;
         lines.truncate(400);
         lines.push(format!("还有 {extra} 行没有放进这一页"));
@@ -1659,47 +1658,67 @@ fn container_output(group: &procs::ContainerGroup, action: ContainerAction) -> s
     Ok((title, lines))
 }
 
-fn exec_args(group: &procs::ContainerGroup) -> std::result::Result<(String, Vec<String>), String> {
-    if !safe_container_id(&group.id) {
+fn action_args(
+    tool: &str,
+    pick: &containers::Pick,
+    action: ContainerAction,
+) -> std::result::Result<Vec<String>, String> {
+    let label = pick_label(pick);
+    if !containers::safe_ref(&label) {
+        return Err("这个名字不能交给命令行".into());
+    }
+    if tool == "crictl" {
+        return match (pick, action) {
+            (containers::Pick::Container { id }, ContainerAction::Logs) => {
+                Ok(vec!["logs".into(), "--tail".into(), "200".into(), id.clone()])
+            }
+            (containers::Pick::Container { id }, ContainerAction::Inspect) => Ok(vec!["inspect".into(), id.clone()]),
+            (containers::Pick::Container { .. }, ContainerAction::Top) => Err("crictl 没有 top".into()),
+            (containers::Pick::Container { id }, ContainerAction::Stats) => Ok(vec!["stats".into(), id.clone()]),
+            (containers::Pick::Image { name }, ContainerAction::Inspect) => Ok(vec!["inspecti".into(), name.clone()]),
+            _ => Err("crictl 不能对这一项做这个操作".into()),
+        };
+    }
+    match (pick, action) {
+        (containers::Pick::Container { id }, ContainerAction::Logs) => {
+            Ok(vec!["logs".into(), "--tail".into(), "200".into(), id.clone()])
+        }
+        (containers::Pick::Container { id }, ContainerAction::Inspect) => Ok(vec!["inspect".into(), id.clone()]),
+        (containers::Pick::Container { id }, ContainerAction::Top) => Ok(vec!["top".into(), id.clone()]),
+        (containers::Pick::Container { id }, ContainerAction::Stats) => {
+            Ok(vec!["stats".into(), "--no-stream".into(), id.clone()])
+        }
+        (containers::Pick::Volume { name }, ContainerAction::Inspect) => {
+            Ok(vec!["volume".into(), "inspect".into(), name.clone()])
+        }
+        (containers::Pick::Network { name }, ContainerAction::Inspect) => {
+            Ok(vec!["network".into(), "inspect".into(), name.clone()])
+        }
+        (containers::Pick::Image { name }, ContainerAction::Inspect) => {
+            Ok(vec!["image".into(), "inspect".into(), name.clone()])
+        }
+        _ => Err("这一项不能做这个操作".into()),
+    }
+}
+
+fn keep_tail(mut lines: Vec<String>, max: usize) -> Vec<String> {
+    if lines.len() <= max {
+        return lines;
+    }
+    let extra = lines.len() - max;
+    lines.drain(0..extra);
+    lines.insert(0, format!("前面还有 {extra} 行"));
+    lines
+}
+
+fn exec_args(tool: &str, id: &str) -> std::result::Result<(String, Vec<String>), String> {
+    if tool.is_empty() {
+        return Err("没有容器命令，不能进入".into());
+    }
+    if !containers::safe_ref(id) {
         return Err("容器 ID 不能交给命令行".into());
     }
-    let bin = container_bin(&group.runtime)?;
-    let args = if bin == "crictl" {
-        vec!["exec".into(), "-it".into(), group.id.clone(), "sh".into()]
-    } else {
-        vec!["exec".into(), "-it".into(), group.id.clone(), "sh".into()]
-    };
-    Ok((bin, args))
-}
-
-fn container_bin(runtime: &str) -> std::result::Result<String, String> {
-    let names: &[&str] = match runtime {
-        "docker" => &["docker"],
-        "podman" => &["podman"],
-        "containerd" | "kubernetes" | "cri-o" => &["nerdctl", "crictl"],
-        "lxc" => &["lxc"],
-        _ => &["docker", "podman", "nerdctl"],
-    };
-    names
-        .iter()
-        .find(|name| command_exists(name))
-        .map(|name| (*name).to_string())
-        .ok_or_else(|| format!("没有找到 {runtime} 的命令行工具"))
-}
-
-fn command_exists(name: &str) -> bool {
-    std::env::var_os("PATH")
-        .map(|path| std::env::split_paths(&path).any(|dir| dir.join(name).is_file()))
-        .unwrap_or(false)
-}
-
-fn safe_container_id(id: &str) -> bool {
-    (4..=64).contains(&id.len()) && id.chars().all(|ch| ch.is_ascii_alphanumeric())
-}
-
-fn selected_container(app: &App) -> Option<&procs::ContainerGroup> {
-    let index = app.board_cursor.checked_sub(1)?;
-    app.containers.get(index)
+    Ok((tool.to_string(), vec!["exec".into(), "-it".into(), id.to_string(), "sh".into()]))
 }
 
 fn action_name(action: ContainerAction) -> &'static str {
@@ -1711,141 +1730,67 @@ fn action_name(action: ContainerAction) -> &'static str {
     }
 }
 
-fn draw_banner(frame: &mut Frame, banner: Banner, area: Rect) {
-    frame.render_widget(ratatui::widgets::Clear, area);
-    let width = area.width.min(56);
-    let height = 12.min(area.height);
-    let rect = Rect {
-        x: area.x + (area.width.saturating_sub(width)) / 2,
-        y: area.y + (area.height.saturating_sub(height)) / 2,
-        width,
-        height,
-    };
-    let mut lines = vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            banner.title,
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-    ];
-    for line in banner.lines {
-        lines.push(Line::from(Span::styled(*line, Style::default().fg(Color::White))));
-    }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "按任意键跳过",
-        Style::default().fg(Color::DarkGray),
-    )));
-    frame.render_widget(
-        Paragraph::new(lines).alignment(Alignment::Center).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
-        ),
-        rect,
-    );
-}
-
 struct Paint {
     text: String,
     color: Color,
 }
 
-fn draw_nav(frame: &mut Frame, app: &mut App, area: Rect) {
-    let items = [
-        ("1", "硬件", "主机、CPU、内存、磁盘、网卡"),
-        ("2", "进程", "进程表、资源下钻、日志"),
-        ("3", "容器", "从 cgroup 识别运行中的容器"),
-        ("4", "防火墙", "过滤表、转发、连接跟踪"),
-        ("5", "网络", "地址、路由、网卡、抓包、吞吐、SSH"),
-        ("6", "日志", "快捷操作、审计、系统服务、分类日志"),
-    ];
-    let inner_w = (area.width.saturating_sub(2) as usize).max(20);
-    let inner_h = (area.height.saturating_sub(2) as usize).max(1);
-    let two_line = inner_h >= 18 && inner_w >= 36;
-    let gap = two_line && inner_h >= 24;
-    let row_h = if two_line { if gap { 3 } else { 2 } } else { 1 };
-    let block_h = items.len() * row_h;
-    let top_pad = inner_h.saturating_sub(block_h) / 2;
-    let mut lines = Vec::new();
-    for _ in 0..top_pad {
-        lines.push(Line::from(""));
-    }
-    for (index, (num, title, detail)) in items.iter().enumerate() {
-        let active = index == app.nav_cursor;
-        if two_line {
-            lines.push(nav_bar(&format!("  {num}  {title}"), inner_w, active, true));
-            lines.push(nav_bar(&format!("     {detail}"), inner_w, active, false));
-            if gap {
-                lines.push(Line::from(""));
-            }
-        } else {
-            let title_cell = pad_cols(title, 8);
-            let detail = fit_cols(detail, inner_w.saturating_sub(16));
-            lines.push(nav_bar(
-                &format!("  {num}  {title_cell}{detail}"),
-                inner_w,
-                active,
-                true,
-            ));
-        }
-        if active {
-            mark_copy(app, &format!("{title}  {detail}"));
-        }
-    }
-    frame.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" 导航 ")),
-        area,
-    );
+enum ScrollSlot {
+    Board,
+    Box,
 }
 
-fn nav_bar(text: &str, width: usize, active: bool, strong: bool) -> Line<'static> {
-    let text = pad_cols(text, width);
-    let style = if active {
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
-    } else if strong {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::Gray)
-    };
-    Line::from(Span::styled(text, style))
-}
-
-fn draw_scroll(frame: &mut Frame, app: &mut App, area: Rect, title: &str, rows: Vec<Paint>) {
+fn draw_scroll(
+    frame: &mut Frame,
+    app: &mut App,
+    area: Rect,
+    title: &str,
+    rows: Vec<Paint>,
+    tail: bool,
+    slot: ScrollSlot,
+) {
     let rows = wrap_paints(rows, area.width.saturating_sub(2) as usize);
+    let (mut cursor, mut scroll) = match slot {
+        ScrollSlot::Board => (app.board_cursor, app.board_scroll),
+        ScrollSlot::Box => (app.box_cursor, app.box_scroll),
+    };
+    if tail {
+        cursor = rows.len().saturating_sub(1);
+    }
     let viewport = area.height.saturating_sub(2) as usize;
     app.board_rows = rows.iter().map(|row| row.text.clone()).collect();
     let last = app.board_rows.len().saturating_sub(1);
-    app.board_cursor = app.board_cursor.min(last);
-    if app.board_cursor < app.board_scroll {
-        app.board_scroll = app.board_cursor;
+    cursor = cursor.min(last);
+    if cursor < scroll {
+        scroll = cursor;
     }
     let view = viewport.max(1);
-    if app.board_cursor >= app.board_scroll + view {
-        app.board_scroll = app.board_cursor + 1 - view;
+    if cursor >= scroll + view {
+        scroll = cursor + 1 - view;
     }
     let max_scroll = rows.len().saturating_sub(view);
-    app.board_scroll = app.board_scroll.min(max_scroll);
-    let copy_text = app.board_rows.get(app.board_cursor).cloned();
-    if let Some(text) = copy_text {
-        mark_copy(app, &text);
+    scroll = scroll.min(max_scroll);
+    match slot {
+        ScrollSlot::Board => {
+            app.board_cursor = cursor;
+            app.board_scroll = scroll;
+        }
+        ScrollSlot::Box => {
+            app.box_cursor = cursor;
+            app.box_scroll = scroll;
+        }
     }
     let title = if rows.len() > view {
-        format!(" {title}  {}/{} ", app.board_cursor + 1, rows.len())
+        format!(" {title}  {}/{} ", cursor + 1, rows.len())
     } else {
         format!(" {title} ")
     };
+    let title = plain_fit(&title, area.width.saturating_sub(2) as usize);
     let lines: Vec<Line> = rows
         .into_iter()
         .enumerate()
         .map(|(index, row)| {
-            let style = if index == app.board_cursor {
+            let style = if index == cursor {
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Cyan)
@@ -1858,7 +1803,7 @@ fn draw_scroll(frame: &mut Frame, app: &mut App, area: Rect, title: &str, rows: 
         .collect();
     frame.render_widget(
         Paragraph::new(lines)
-            .scroll((app.board_scroll as u16, 0))
+            .scroll((scroll as u16, 0))
             .block(Block::default().borders(Borders::ALL).title(title)),
         area,
     );
@@ -1887,16 +1832,14 @@ fn on_syslog_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char('q') => true,
         KeyCode::Esc => {
             if !app.syslog_unit.is_empty() {
-                app.syslog_unit.clear();
-                app.full_clear = true;
-                load_syslog(app, true);
+                close_syslog_unit(app);
                 false
             } else if !app.syslog_query.is_empty() {
                 app.syslog_query.clear();
                 app.board_cursor = 1;
                 false
             } else {
-                return_to_nav(app);
+                return_to_procs(app);
                 false
             }
         }
@@ -1911,13 +1854,30 @@ fn on_syslog_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char(ch @ '1'..='8') => {
             app.syslog_kind = (ch as u8 - b'1') as usize;
             app.syslog_unit.clear();
+            app.syslog_anchor = None;
             app.board_cursor = 0;
             app.board_scroll = 0;
             app.full_clear = true;
             load_syslog(app, true);
             false
         }
-        _ => on_scroll_key(app, key),
+        _ => {
+            let quit = on_scroll_key(app, key);
+            if syslog_stream(app) {
+                match key.code {
+                    KeyCode::Char('G') => app.log_follow = true,
+                    KeyCode::Char('g') | KeyCode::Char('k') | KeyCode::Up | KeyCode::PageUp => {
+                        app.log_follow = false
+                    }
+                    KeyCode::Char('j') | KeyCode::Down | KeyCode::PageDown => {
+                        let last = app.board_rows.len().saturating_sub(1);
+                        app.log_follow = app.board_cursor >= last;
+                    }
+                    _ => {}
+                }
+            }
+            quit
+        }
     }
 }
 
@@ -1931,9 +1891,35 @@ fn open_syslog_unit(app: &mut App) {
     let Some(unit) = syslog::unit_name(&line) else {
         return;
     };
+    app.syslog_anchor = Some(app.board_cursor);
     app.syslog_unit = unit;
     app.full_clear = true;
     load_syslog(app, true);
+}
+
+fn close_syslog_unit(app: &mut App) {
+    let unit = app.syslog_unit.clone();
+    let fallback = app.syslog_anchor.take();
+    app.syslog_unit.clear();
+    app.full_clear = true;
+    load_syslog(app, false);
+    if let Some(cursor) = syslog_row_for(app, &unit) {
+        app.board_cursor = cursor;
+    } else if let Some(cursor) = fallback {
+        app.board_cursor = cursor;
+    }
+}
+
+fn syslog_row_for(app: &App, unit: &str) -> Option<usize> {
+    let matched: Vec<&String> = app
+        .syslog_lines
+        .iter()
+        .filter(|line| sniff::query_match(line, &app.syslog_query))
+        .collect();
+    let pos = matched
+        .iter()
+        .position(|line| syslog::unit_name(line).as_deref() == Some(unit))?;
+    Some(pos + 2)
 }
 
 fn on_syslog_filter_key(app: &mut App, key: KeyEvent) -> bool {
@@ -2014,182 +2000,185 @@ fn log_color(line: &str) -> Color {
     }
 }
 
-fn hardware_lines(app: &App, width: u16) -> Vec<Paint> {
+fn container_lines(app: &mut App, width: u16) -> Vec<Paint> {
     let width = width.saturating_sub(2) as usize;
+    let inventory = app.inventory.clone();
     let mut rows = Vec::new();
-    let hw = &app.hardware;
-    paint_section(&mut rows, "主机", width);
-    paint_field(&mut rows, "厂商", &shown(&hw.vendor), Color::Cyan, width);
-    paint_field(&mut rows, "型号", &shown(&hw.product), Color::Cyan, width);
-    paint_field(&mut rows, "版本", &shown(&hw.version), Color::Cyan, width);
-    paint_field(&mut rows, "序列号", &shown(&hw.serial), Color::Yellow, width);
-    paint_field(&mut rows, "UUID", &shown(&hw.uuid), Color::Cyan, width);
-    paint_field(&mut rows, "BIOS", &shown(&hw.bios), Color::Cyan, width);
-    paint_field(&mut rows, "主板", &shown(&hw.board), Color::Cyan, width);
-    paint_field(&mut rows, "处理器", &shown(&hw.cpu), Color::Cyan, width);
-    paint_field(&mut rows, "内存", &shown(&hw.memory), Color::Cyan, width);
-    paint_field(&mut rows, "系统", &app.host_line, Color::Cyan, width);
-    paint_field(&mut rows, "虚拟化", virt_text(&app.virt), Color::Cyan, width);
-    paint_section(&mut rows, "磁盘", width);
-    if hw.disks.is_empty() {
-        paint_field(&mut rows, "磁盘", "没有读到", Color::Gray, width);
-    } else {
-        rows.push(Paint {
-            text: table_row(&[("磁盘", 8), ("容量", 10), ("类型", 6), ("型号", 24), ("序列号", 16)]),
-            color: Color::DarkGray,
-        });
-        for disk in &hw.disks {
-            rows.push(Paint {
-                text: table_row(&[
-                    (&disk.name, 8),
-                    (&disk.size, 10),
-                    (&disk.kind, 6),
-                    (&disk.model, 24),
-                    (&disk.serial, 16),
-                ]),
-                color: Color::Cyan,
-            });
-        }
-    }
-    paint_section(&mut rows, "实时", width);
-    let Some(rates) = &app.rates else {
-        paint_field(&mut rows, "采样", "还在等下一拍", Color::Gray, width);
-        return rows;
-    };
-    paint_field(
-        &mut rows,
-        "CPU",
-        &format!(
-            "{}  用户 {}  系统 {}  等待 IO {}  中断 {}  窃取 {}  {} 核",
-            procs::cpu_percent(rates.cpu.busy_ratio),
-            procs::cpu_percent(rates.cpu.user_ratio),
-            procs::cpu_percent(rates.cpu.system_ratio),
-            procs::cpu_percent(rates.cpu.iowait_ratio),
-            procs::cpu_percent(rates.cpu.irq_ratio),
-            procs::cpu_percent(rates.cpu.steal_ratio),
-            rates.cpu.ncpu
-        ),
-        heat_color(rates.cpu.busy_ratio, 0.50, 0.80),
-        width,
-    );
-    paint_field(
-        &mut rows,
-        "负载",
-        &format!("{:.2}  {:.2}  {:.2}", rates.load1, rates.load5, rates.load15),
-        Color::Cyan,
-        width,
-    );
-    paint_field(
-        &mut rows,
-        "可用内存",
-        &format!(
-            "{:.0}%  脏页 {}  换入 {:.0}/s  换出 {:.0}/s",
-            rates.mem_available_ratio * 100.0,
-            procs::human_kb(rates.dirty_kb),
-            rates.swap_in_per_sec,
-            rates.swap_out_per_sec
-        ),
-        heat_color(1.0 - rates.mem_available_ratio, 0.70, 0.90),
-        width,
-    );
-    if let Some(psi) = rates.psi_io {
-        paint_field(
+    let mut picks = Vec::new();
+    if !inventory.note.is_empty() {
+        push_pick(&mut rows, &mut picks, inventory.note.clone(), Color::Yellow, None, width);
+    } else if !inventory.tool.is_empty() {
+        push_pick(
             &mut rows,
-            "IO 压力",
-            &format!("some {:.1}  full {:.1}", psi.some_avg10, psi.full_avg10),
-            heat_color(psi.some_avg10, 20.0, 50.0),
+            &mut picks,
+            format!("工具  {}", inventory.tool),
+            Color::DarkGray,
+            None,
             width,
         );
     }
-    paint_section(&mut rows, "块设备", width);
-    rows.push(Paint {
-        text: table_row(&[
-            ("块设备", 8),
-            ("利用率", 8),
-            ("等待", 10),
-            ("读", 8),
-            ("写", 8),
-            ("在途", 6),
-        ]),
-        color: Color::DarkGray,
-    });
-    if rates.disks.is_empty() {
-        rows.push(Paint {
-            text: "没有磁盘速率".into(),
-            color: Color::Gray,
-        });
+    push_kind(
+        &mut rows,
+        &mut picks,
+        "容器",
+        &inventory.containers.iter().map(|item| item.state.clone()).collect::<Vec<_>>(),
+        inventory.containers.is_empty(),
+        if inventory.containers.is_empty() {
+            "没有容器".into()
+        } else {
+            String::new()
+        },
+        width,
+    );
+    if !inventory.containers.is_empty() {
+        push_pick(
+            &mut rows,
+            &mut picks,
+            table_row(&[("状态", 12), ("名称", 18), ("镜像", 18), ("命令", 12)]),
+            Color::DarkGray,
+            None,
+            width,
+        );
+        for item in &inventory.containers {
+            let name = if item.name.is_empty() { item.id.as_str() } else { item.name.as_str() };
+            let command = if item.command.is_empty() { "—" } else { item.command.as_str() };
+            push_pick(
+                &mut rows,
+                &mut picks,
+                table_row(&[
+                    (item.state.as_str(), 12),
+                    (name, 18),
+                    (item.image.as_str(), 18),
+                    (command, 12),
+                ]),
+                asset_color(&item.state),
+                Some(containers::Pick::Container { id: item.id.clone() }),
+                width,
+            );
+        }
     }
-    for disk in &rates.disks {
-        let util = format!("{:.0}%", disk.util * 100.0);
-        let wait = format!("{:.1} ms", disk.await_ms);
-        let read = format!("{:.0}/s", disk.read_iops);
-        let write = format!("{:.0}/s", disk.write_iops);
-        let inflight = disk.in_flight.to_string();
-        rows.push(Paint {
-            text: table_row(&[
-                (disk.name.as_str(), 8),
-                (util.as_str(), 8),
-                (wait.as_str(), 10),
-                (read.as_str(), 8),
-                (write.as_str(), 8),
-                (inflight.as_str(), 6),
-            ]),
-            color: heat_color(disk.util, 0.50, 0.90),
-        });
+    push_asset_section(
+        &mut rows,
+        &mut picks,
+        "存储卷",
+        &inventory.volumes,
+        &inventory.volume_note,
+        "没有存储卷",
+        width,
+        |item| containers::Pick::Volume { name: item.name.clone() },
+    );
+    push_asset_section(
+        &mut rows,
+        &mut picks,
+        "网络",
+        &inventory.networks,
+        &inventory.network_note,
+        "没有网络",
+        width,
+        |item| containers::Pick::Network { name: item.name.clone() },
+    );
+    push_asset_section(
+        &mut rows,
+        &mut picks,
+        "镜像",
+        &inventory.images,
+        &inventory.image_note,
+        "没有镜像",
+        width,
+        |item| containers::Pick::Image { name: item.name.clone() },
+    );
+    if app.container_place {
+        if let Some(index) = picks.iter().position(|pick| pick.is_some()) {
+            app.board_cursor = index;
+        }
+        app.container_place = false;
     }
+    app.container_picks = picks;
     rows
 }
 
-fn virt_text(virt: &str) -> &str {
-    match virt {
-        "none" => "物理机或未识别",
-        "kvm" => "KVM",
-        "xen" => "Xen",
-        "vmware" => "VMware",
-        "virtualbox" => "VirtualBox",
-        "hyperv" => "Hyper-V",
-        "hypervisor" => "虚拟机",
-        "演示" => "演示",
-        _ => virt,
+fn push_kind(
+    rows: &mut Vec<Paint>,
+    picks: &mut Vec<Option<containers::Pick>>,
+    label: &str,
+    states: &[String],
+    empty: bool,
+    empty_text: String,
+    width: usize,
+) {
+    paint_section(rows, &containers::count_text(label, states), width);
+    if let Some(last) = rows.last_mut() {
+        last.text = fit_cols(&last.text, width.max(1));
+    }
+    picks.push(None);
+    if empty && !empty_text.is_empty() {
+        push_pick(rows, picks, empty_text, Color::Gray, None, width);
     }
 }
 
-fn container_lines(app: &App, width: u16) -> Vec<Paint> {
-    let width = width.saturating_sub(2) as usize;
-    let mut rows = Vec::new();
-    paint_section(&mut rows, "运行中", width);
-    rows.push(Paint {
-        text: table_row(&[
-            ("运行时", 12),
-            ("ID", 14),
-            ("任务", 6),
-            ("RSS", 10),
-            ("进程", 20),
-        ]),
-        color: Color::DarkGray,
-    });
-    if app.containers.is_empty() {
-        rows.push(Paint {
-            text: "没有从 cgroup 识别到容器".into(),
-            color: Color::Gray,
-        });
-        return rows;
+fn push_asset_section(
+    rows: &mut Vec<Paint>,
+    picks: &mut Vec<Option<containers::Pick>>,
+    label: &str,
+    items: &[containers::Asset],
+    note: &str,
+    empty_text: &str,
+    width: usize,
+    pick: impl Fn(&containers::Asset) -> containers::Pick,
+) {
+    let states: Vec<String> = items.iter().map(|item| item.state.clone()).collect();
+    push_kind(rows, picks, label, &states, items.is_empty(), String::new(), width);
+    if items.is_empty() {
+        let text = if note.is_empty() { empty_text.to_string() } else { note.to_string() };
+        push_pick(rows, picks, text, Color::Gray, None, width);
+        return;
     }
-    for group in &app.containers {
-        let tasks = group.tasks.to_string();
-        let rss = procs::human_kb(group.rss_kb);
-        rows.push(Paint {
-            text: table_row(&[
-                (group.runtime.as_str(), 12),
-                (group.id.as_str(), 14),
-                (tasks.as_str(), 6),
-                (rss.as_str(), 10),
-                (group.comms.as_str(), 20),
+    push_pick(
+        rows,
+        picks,
+        table_row(&[("状态", 12), ("名称", 24), ("信息", 12)]),
+        Color::DarkGray,
+        None,
+        width,
+    );
+    for item in items {
+        push_pick(
+            rows,
+            picks,
+            table_row(&[
+                (item.state.as_str(), 12),
+                (item.name.as_str(), 24),
+                (item.detail.as_str(), 12),
             ]),
-            color: Color::Cyan,
-        });
+            asset_color(&item.state),
+            Some(pick(item)),
+            width,
+        );
     }
-    rows
+}
+
+fn push_pick(
+    rows: &mut Vec<Paint>,
+    picks: &mut Vec<Option<containers::Pick>>,
+    text: String,
+    color: Color,
+    pick: Option<containers::Pick>,
+    width: usize,
+) {
+    rows.push(Paint {
+        text: fit_cols(&board::plain_line(&text), width.max(1)),
+        color,
+    });
+    picks.push(pick);
+}
+
+fn asset_color(state: &str) -> Color {
+    match state {
+        "running" | "in-use" | "active" => Color::Green,
+        "exited" | "unused" | "idle" | "dangling" => Color::DarkGray,
+        "paused" | "restarting" | "dead" => Color::Yellow,
+        _ => Color::Cyan,
+    }
 }
 
 fn firewall_lines(app: &App, width: u16) -> Vec<Paint> {
@@ -2226,7 +2215,9 @@ fn firewall_lines(app: &App, width: u16) -> Vec<Paint> {
 
 fn draw_network(frame: &mut Frame, app: &mut App, area: Rect) {
     match app.net_focus {
-        NetFocus::Config => draw_scroll(frame, app, area, "网络  配置", net_config_lines(app, area.width)),
+        NetFocus::Config => {
+            draw_scroll(frame, app, area, "网络  配置", net_config_lines(app, area.width), false, ScrollSlot::Board)
+        }
         NetFocus::Ifaces => draw_ifaces(frame, app, area),
         NetFocus::Capture => draw_capture(frame, app, area),
         NetFocus::Ssh => draw_ssh(frame, app, area),
@@ -2367,10 +2358,10 @@ fn draw_ifaces(frame: &mut Frame, app: &mut App, area: Rect) {
         } else {
             Style::default().fg(Color::Cyan)
         };
-        if index == app.iface_cursor {
-            mark_copy(app, label);
-        }
-        lines.push(Line::from(Span::styled(format!("  {label}"), style)));
+        lines.push(Line::from(Span::styled(
+            plain_fit(&format!("  {label}"), area.width.saturating_sub(2) as usize),
+            style,
+        )));
     }
     frame.render_widget(
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" 抓包 ")),
@@ -2402,16 +2393,18 @@ fn draw_capture(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     let max_scroll = packets.len().saturating_sub(view);
     app.packet_scroll = app.packet_scroll.min(max_scroll);
-    let copy_text = packets.get(app.packet_cursor).map(|item| item.text.clone());
     let start = app.packet_scroll;
     let end = (start + view).min(packets.len());
     let mut lines = Vec::new();
+    let inner = area.width.saturating_sub(2) as usize;
     if packets.is_empty() {
-        lines.push(Line::from(Span::styled(
-            app.cap_note.clone(),
-            Style::default().fg(Color::Yellow),
-        )));
-        lines.push(Line::from("等待报文。/ 筛选，x 只看异常，回车拆包。p 暂停后缓冲会留着。"));
+        push_wrapped(&mut lines, &app.cap_note, Style::default().fg(Color::Yellow), inner);
+        push_wrapped(
+            &mut lines,
+            "等待报文。/ 筛选，x 只看异常，回车拆包。p 暂停后缓冲会留着。",
+            Style::default(),
+            inner,
+        );
     } else {
         for (index, item) in packets.iter().enumerate().take(end).skip(start) {
             let style = if index == app.packet_cursor {
@@ -2422,7 +2415,7 @@ fn draw_capture(frame: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 Style::default().fg(packet_color(item))
             };
-            lines.push(Line::from(Span::styled(item.text.clone(), style)));
+            lines.push(Line::from(Span::styled(plain_fit(&item.text, inner), style)));
         }
     }
     let state = if app.cap_paused { "已暂停" } else { "采集中" };
@@ -2432,21 +2425,21 @@ fn draw_capture(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         format!("  /{}", app.cap_query)
     };
-    let title = format!(
-        " 抓包  {state}  {}  {focus}{query}  {} 条 ",
-        app.cap_note,
-        packets.len()
+    let title = plain_fit(
+        &format!(
+            " 抓包  {state}  {}  {focus}{query}  {} 条 ",
+            app.cap_note,
+            packets.len()
+        ),
+        area.width.saturating_sub(2) as usize,
     );
-    if let Some(text) = copy_text {
-        mark_copy(app, &text);
-    }
     frame.render_widget(
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title)),
         area,
     );
 }
 
-fn draw_packet_detail(frame: &mut Frame, app: &mut App, area: Rect, item: Option<ShownPacket>) {
+fn draw_packet_detail(frame: &mut Frame, _app: &mut App, area: Rect, item: Option<ShownPacket>) {
     let Some(item) = item else {
         frame.render_widget(
             Paragraph::new("没有符合条件的报文").block(Block::default().borders(Borders::ALL).title(" 拆包 ")),
@@ -2454,39 +2447,49 @@ fn draw_packet_detail(frame: &mut Frame, app: &mut App, area: Rect, item: Option
         );
         return;
     };
-    let copy = if item.layers.is_empty() {
-        item.text.clone()
-    } else {
-        item.layers.join("  |  ")
-    };
-    mark_copy(app, &copy);
-    let mut lines = vec![
-        Line::from(Span::styled(item.text.clone(), Style::default().fg(packet_color(&item)).add_modifier(Modifier::BOLD))),
-        Line::from(""),
-    ];
+    let width = area.width.saturating_sub(2) as usize;
+    let mut lines = Vec::new();
+    push_wrapped(
+        &mut lines,
+        &item.text,
+        Style::default().fg(packet_color(&item)).add_modifier(Modifier::BOLD),
+        width,
+    );
+    lines.push(Line::from(""));
     let state = if item.abnormal {
         format!("异常  {}", item.reason)
     } else {
         "正常".into()
     };
-    lines.push(Line::from(Span::styled(
-        state,
+    push_wrapped(
+        &mut lines,
+        &state,
         Style::default().fg(if item.abnormal { Color::Red } else { Color::Green }),
-    )));
+        width,
+    );
     lines.push(Line::from(""));
     if item.layers.is_empty() {
         lines.push(Line::from("没有拆出层次"));
     } else {
         for layer in &item.layers {
-            lines.push(Line::from(Span::styled(layer.clone(), Style::default().fg(Color::Cyan))));
+            push_wrapped(&mut lines, layer, Style::default().fg(Color::Cyan), width);
         }
     }
     frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .block(Block::default().borders(Borders::ALL).title(" 拆包 ")),
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" 拆包 ")),
         area,
     );
+}
+
+fn push_wrapped(lines: &mut Vec<Line<'static>>, text: &str, style: Style, width: usize) {
+    let parts = safe_wrap(text, width);
+    if parts.is_empty() {
+        lines.push(Line::from(""));
+        return;
+    }
+    for part in parts {
+        lines.push(Line::from(Span::styled(part, style)));
+    }
 }
 
 fn packet_color(item: &ShownPacket) -> Color {
@@ -2536,10 +2539,20 @@ fn draw_ssh(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::Red),
         )));
     }
+    let width = area.width.saturating_sub(2) as usize;
+    let lines = lines
+        .into_iter()
+        .flat_map(|line| {
+            let text: String = line.spans.iter().map(|span| span.content.to_string()).collect();
+            let style = line.spans.first().map(|span| span.style).unwrap_or_default();
+            safe_wrap(&text, width)
+                .into_iter()
+                .map(move |part| Line::from(Span::styled(part, style)))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
     frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .block(Block::default().borders(Borders::ALL).title(" SSH ")),
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" SSH ")),
         area,
     );
 }
@@ -2558,10 +2571,6 @@ fn draw_bench(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         app.bench_host.clone()
     };
-    let summary = format!(
-        "发送 {sent_mib:.1} MiB/s  {sent_mbps:.1} Mbps    接收 {recv_mib:.1} MiB/s  {recv_mbps:.1} Mbps"
-    );
-    mark_copy(app, &summary);
     let mut lines = vec![
         Line::from(""),
         Line::from(format!("  协议    {}", app.bench_proto.label())),
@@ -2605,10 +2614,20 @@ fn draw_bench(frame: &mut Frame, app: &mut App, area: Rect) {
     if app.bench_listen {
         lines[3] = Line::from(Span::styled("  主机    本机所有地址", Style::default().fg(Color::Gray)));
     }
+    let width = area.width.saturating_sub(2) as usize;
+    let lines = lines
+        .into_iter()
+        .flat_map(|line| {
+            let text: String = line.spans.iter().map(|span| span.content.to_string()).collect();
+            let style = line.spans.first().map(|span| span.style).unwrap_or_default();
+            safe_wrap(&text, width)
+                .into_iter()
+                .map(move |part| Line::from(Span::styled(part, style)))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
     frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .block(Block::default().borders(Borders::ALL).title(" 吞吐 ")),
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" 吞吐 ")),
         area,
     );
 }
@@ -2633,7 +2652,7 @@ fn net_crumb(app: &App) -> &'static str {
 
 fn net_footer(app: &App) -> String {
     match app.net_focus {
-        NetFocus::Config => "1 配置  2 抓包  3 SSH  4 吞吐    j/k 选择并复制  Esc 返回  q 退出".into(),
+        NetFocus::Config => "1 配置  2 抓包  3 SSH  4 吞吐    j/k 选择  Esc 返回  q 退出".into(),
         NetFocus::Ifaces => "j/k 选择网卡  回车开始  a 全部  Esc 返回  q 退出".into(),
         NetFocus::Capture if app.cap_filtering => "筛选报文，多个词用空格隔开，回车确认，Esc 取消".into(),
         NetFocus::Capture if app.cap_detail => "j/k 上一条下一条  Esc 返回列表  q 退出".into(),
@@ -2645,48 +2664,63 @@ fn net_footer(app: &App) -> String {
 
 fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
-    if let Some(banner) = app.banner {
-        draw_banner(frame, banner, area);
-        return;
-    }
     if area.height < 8 || area.width < 40 {
         frame.render_widget(Paragraph::new("终端至少需要 40 列、8 行"), area);
         return;
     }
+        let head = if app.screen == Screen::Procs { 4 } else { 1 };
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
-            Constraint::Length(1),
+            Constraint::Length(head),
             Constraint::Min(4),
             Constraint::Length(1),
         ])
         .split(area);
     app.page_rows = rows[2].height.saturating_sub(3) as usize;
     draw_status(frame, app, rows[0]);
-    draw_crumb(frame, app, rows[1]);
+    if app.screen == Screen::Procs {
+        draw_proc_head(frame, app, rows[1]);
+    } else {
+        draw_crumb(frame, app, rows[1]);
+    }
     match app.screen {
-        Screen::Nav => draw_nav(frame, app, rows[2]),
-        Screen::Hardware => draw_scroll(frame, app, rows[2], "硬件", hardware_lines(app, rows[2].width)),
         Screen::Procs => draw_home(frame, app, rows[2]),
         Screen::Process => draw_process(frame, app, rows[2]),
         Screen::Logs => draw_logs(frame, app, rows[2]),
         Screen::Containers => {
             if app.box_output {
+                let follow = app.box_action == Some(ContainerAction::Logs) && app.log_follow;
+                let title = if follow {
+                    format!("{}  跟踪", app.box_title)
+                } else {
+                    app.box_title.clone()
+                };
                 draw_scroll(
                     frame,
                     app,
                     rows[2],
-                    &app.box_title.clone(),
+                    &title,
                     plain_paints(&app.box_lines.clone()),
+                    follow,
+                    ScrollSlot::Box,
                 );
             } else {
-                draw_scroll(frame, app, rows[2], "容器", container_lines(app, rows[2].width));
+                let lines = container_lines(app, rows[2].width);
+                draw_scroll(frame, app, rows[2], "容器", lines, false, ScrollSlot::Board);
             }
         }
-        Screen::Firewall => draw_scroll(frame, app, rows[2], "防火墙", firewall_lines(app, rows[2].width)),
+        Screen::Firewall => {
+            draw_scroll(frame, app, rows[2], "防火墙", firewall_lines(app, rows[2].width), false, ScrollSlot::Board)
+        }
         Screen::Network => draw_network(frame, app, rows[2]),
-        Screen::Syslog => draw_scroll(frame, app, rows[2], "日志", syslog_paints(app, rows[2].width)),
+        Screen::Syslog => {
+            let follow = syslog_stream(app) && app.log_follow;
+            let title = if follow { "日志  跟踪" } else { "日志" };
+            let lines = syslog_paints(app, rows[2].width);
+            draw_scroll(frame, app, rows[2], title, lines, follow, ScrollSlot::Board);
+        }
     }
     draw_footer(frame, app, rows[3]);
     if app.help {
@@ -2694,21 +2728,154 @@ fn draw(frame: &mut Frame, app: &mut App) {
     }
 }
 
+fn draw_proc_head(frame: &mut Frame, app: &App, area: Rect) {
+    let brief = hardware_brief(app);
+    if area.width < 72 {
+        let lines = brief
+            .into_iter()
+            .take(area.height as usize)
+            .map(|row| hw_line(&row.0, &row.1, row.2, area.width as usize))
+            .collect::<Vec<_>>();
+        frame.render_widget(Paragraph::new(lines), area);
+        return;
+    }
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(36), Constraint::Length(42)])
+        .split(area);
+    let left = brief
+        .into_iter()
+        .take(columns[0].height as usize)
+        .map(|row| hw_line(&row.0, &row.1, row.2, columns[0].width as usize))
+        .collect::<Vec<_>>();
+    let right = shortcut_lines(columns[1].height as usize, columns[1].width as usize);
+    frame.render_widget(Paragraph::new(left), columns[0]);
+    frame.render_widget(Paragraph::new(right), columns[1]);
+}
+
+fn hardware_brief(app: &App) -> Vec<(String, String, Color)> {
+    let hw = &app.hardware;
+    let host = format!("{}  {}", shown(&hw.product), shown(&hw.vendor));
+    let serial = if hw.serial.trim().is_empty() {
+        String::new()
+    } else {
+        format!("  SN {}", hw.serial.trim())
+    };
+    let mut rows = vec![
+        ("主机".into(), format!("{host}{serial}"), Color::Cyan),
+        ("CPU".into(), shown(&hw.cpu), Color::Cyan),
+        ("磁盘".into(), disk_line(&hw.disks), Color::Cyan),
+    ];
+    rows.insert(0, verdict_brief(app));
+    rows
+}
+
+fn disk_line(disks: &[board::HwDisk]) -> String {
+    if disks.is_empty() {
+        return "没有磁盘".into();
+    }
+    let total: u64 = disks.iter().map(|disk| disk.bytes).sum();
+    let parts = disks
+        .iter()
+        .map(|disk| format!("{} {}", disk.name, capacity_text(disk.bytes)))
+        .collect::<Vec<_>>()
+        .join("   ");
+    format!("共{} [ {} ]", capacity_text(total), parts)
+}
+
+fn capacity_text(bytes: u64) -> String {
+    let gib = bytes as f64 / 1024.0 / 1024.0 / 1024.0;
+    if gib >= 1.0 {
+        format!("{gib:.1}GiB")
+    } else if bytes >= 1024 * 1024 {
+        format!("{:.0}MiB", bytes as f64 / 1024.0 / 1024.0)
+    } else {
+        format!("{bytes}B")
+    }
+}
+
+fn verdict_brief(app: &App) -> (String, String, Color) {
+    let Some(finding) = app.findings.first() else {
+        return ("结论".into(), app.status.clone(), Color::Gray);
+    };
+    let action = advise::action(finding, &app.processes);
+    let mut text = if matches!(finding.severity, Severity::Warning | Severity::Critical) {
+        format!("{}  {}", finding.severity.label(), finding.title)
+    } else {
+        finding.title.clone()
+    };
+    if let Some(proc) = action.actors.first() {
+        text.push_str(&format!("  {} {}", proc.comm, proc.pid));
+    }
+    if !app.filter.is_empty() {
+        text.push_str(&format!("  /{}", app.filter));
+    }
+    ("结论".into(), text, severity_color(finding.severity))
+}
+
+fn hw_line(label: &str, value: &str, color: Color, width: usize) -> Line<'static> {
+    Line::from(fit_spans(
+        vec![
+            Span::styled(
+                format!("{}  ", pad_cols(label, 4)),
+                Style::default().fg(Color::Gray),
+            ),
+            Span::styled(value.to_string(), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        ],
+        width,
+    ))
+}
+
+fn shortcut_lines(rows: usize, width: usize) -> Vec<Line<'static>> {
+    const GRID: &[&[(&str, &str)]] = &[
+        &[("1", "容器"), ("/", "筛选")],
+        &[("2", "防火墙"), ("回车", "下钻")],
+        &[("3", "网络")],
+        &[("4", "日志")],
+    ];
+    if rows == 0 {
+        return Vec::new();
+    }
+    if rows == 1 {
+        return vec![hint_line(
+            &[("1", "容器"), ("2", "防火墙"), ("3", "网络"), ("4", "日志")],
+            width,
+        )];
+    }
+    GRID.iter().take(rows).map(|pairs| hint_line(pairs, width)).collect()
+}
+
+fn hint_line(pairs: &[(&str, &str)], width: usize) -> Line<'static> {
+    let mut spans = Vec::new();
+    for (index, (key, label)) in pairs.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled(
+            key_cell(key),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(label_cell(label), Style::default().fg(Color::White)));
+    }
+    Line::from(fit_spans(spans, width))
+}
+
+fn key_cell(key: &str) -> String {
+    let pad = 4usize.saturating_sub(display_cols(key));
+    let left = pad / 2;
+    format!("{}{key}{}", " ".repeat(left), " ".repeat(pad - left))
+}
+
+fn label_cell(label: &str) -> String {
+    format!(" {}", pad_cols(label, 6))
+}
+
 fn draw_home(frame: &mut Frame, app: &mut App, area: Rect) {
     let visible = visible_procs(app);
     place_cursor(app, &visible);
-    if let Some(proc) = visible.get(app.cursor) {
-        mark_copy(
-            app,
-            &format!(
-                "{}  {}  CPU {}  内存 {}",
-                proc.pid,
-                procs::display_cmd(proc, 60),
-                procs::cpu_percent(proc.cpu_ratio),
-                procs::human_kb(proc.rss_kb)
-            ),
-        );
-    }
     let header = Row::new(vec![
         col_title("PID", SortKey::Pid, app),
         col_title("CPU", SortKey::Cpu, app),
@@ -2737,12 +2904,13 @@ fn draw_home(frame: &mut Frame, app: &mut App, area: Rect) {
                     procs::human_bps(proc.write_bps),
                     heat_color(proc.write_bps, 1_000_000.0, 50_000_000.0),
                 ),
-                metric_cell(procs::state_label(&proc.state), state_color(&proc.state)),
-                Cell::from(procs::display_cmd(proc, 80)),
+                metric_cell(proc.state.clone(), state_color(&proc.state)),
+                Cell::from(board::plain_line(&procs::display_cmd(proc, 80))),
             ])
         })
         .collect();
-    let title = format!(" 进程  {} ", visible.len());
+    let title = process_title(&visible, area.width);
+    let sort_hint = sort_title(area.width, &title);
     let table = Table::new(
         rows,
         [
@@ -2751,12 +2919,17 @@ fn draw_home(frame: &mut Frame, app: &mut App, area: Rect) {
             Constraint::Length(8),
             Constraint::Length(10),
             Constraint::Length(10),
-            Constraint::Length(6),
+            Constraint::Length(7),
             Constraint::Min(12),
         ],
     )
     .header(header)
-    .block(Block::default().borders(Borders::ALL).title(title))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .title(sort_hint),
+    )
     .highlight_spacing(HighlightSpacing::Never)
     .row_highlight_style(
         Style::default()
@@ -2771,6 +2944,32 @@ fn draw_home(frame: &mut Frame, app: &mut App, area: Rect) {
     };
     app.table_state.select(selected);
     frame.render_stateful_widget(table, area, &mut app.table_state);
+}
+
+fn process_title(procs: &[ProcRate], width: u16) -> String {
+    let states: Vec<String> = procs
+        .iter()
+        .map(|proc| proc.state.clone())
+        .filter(|state| !state.is_empty())
+        .collect();
+    let summary = containers::tally(&states);
+    let title = if summary.is_empty() {
+        format!(" 进程  {} ", procs.len())
+    } else {
+        format!(" 进程  {}  {summary} ", procs.len())
+    };
+    let room = (width as usize).saturating_sub(36).max(18);
+    fit_cols(&title, room)
+}
+
+fn sort_title(width: u16, left_title: &str) -> Line<'static> {
+    let hint = " c CPU  m 内存  r 读  w 写  p PID  n 名字 ";
+    let room = (width as usize).saturating_sub(display_cols(left_title) + 4);
+    Line::from(Span::styled(
+        fit_cols(hint, room),
+        Style::default().fg(Color::DarkGray),
+    ))
+    .alignment(Alignment::Right)
 }
 
 fn draw_process(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -3032,15 +3231,6 @@ fn draw_process(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         " 实时 ".into()
     };
-    let copy = text.get(app.process_scroll).map(|line| {
-        line.spans
-            .iter()
-            .map(|span| span.content.to_string())
-            .collect::<String>()
-    });
-    if let Some(line) = copy {
-        mark_copy(app, &line);
-    }
     frame.render_widget(
         Paragraph::new(text)
             .scroll((app.process_scroll as u16, 0))
@@ -3052,22 +3242,19 @@ fn draw_process(frame: &mut Frame, app: &mut App, area: Rect) {
 fn draw_logs(frame: &mut Frame, app: &mut App, area: Rect) {
     let inner_height = area.height.saturating_sub(2) as usize;
     let lines = log_window(&app.log_lines, inner_height, app.log_from_bottom);
-    if let Some(line) = lines.first() {
-        mark_copy(app, line);
-    }
-    let body = if lines.is_empty() {
-        vec![Line::from(app.log_note.clone())]
+    let width = area.width.saturating_sub(2) as usize;
+    let body: Vec<Line> = if lines.is_empty() {
+        safe_wrap(&app.log_note, width).into_iter().map(Line::from).collect()
     } else {
-        lines.into_iter().map(Line::from).collect()
+        lines
+            .into_iter()
+            .flat_map(|line| safe_wrap(&line, width).into_iter().map(Line::from))
+            .collect()
     };
+    let mark = if app.log_follow { "  跟踪" } else { "" };
+    let title = plain_fit(&format!(" 日志  {}{mark} ", app.log_note), width);
     frame.render_widget(
-        Paragraph::new(body)
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(format!(" 日志  {} ", app.log_note)),
-            ),
+        Paragraph::new(body).block(Block::default().borders(Borders::ALL).title(title)),
         area,
     );
 }
@@ -3086,10 +3273,15 @@ fn log_window(lines: &[String], height: usize, from_bottom: usize) -> Vec<String
 
 fn draw_crumb(frame: &mut Frame, app: &App, area: Rect) {
     let line = match app.screen {
-        Screen::Nav => Line::from(" 导航"),
-        Screen::Hardware => Line::from(" 硬件"),
         Screen::Procs => verdict_line(app),
-        Screen::Containers => Line::from(" 容器"),
+        Screen::Containers => {
+            let tool = if app.inventory.tool.is_empty() {
+                "无命令"
+            } else {
+                app.inventory.tool.as_str()
+            };
+            Line::from(format!(" 容器  {tool}"))
+        }
         Screen::Firewall => Line::from(" 防火墙"),
         Screen::Network => Line::from(format!(" 网络  {}", net_crumb(app))),
         Screen::Syslog => {
@@ -3098,14 +3290,13 @@ fn draw_crumb(frame: &mut Frame, app: &App, area: Rect) {
             } else {
                 format!("{}  {}", syslog::LogKind::from_index(app.syslog_kind).label(), app.syslog_unit)
             };
-            Line::from(fit_cols(
-                &format!(" 日志  {label}  {}", app.syslog_source),
-                area.width as usize,
-            ))
+            Line::from(format!(" 日志  {label}  {}", app.syslog_source))
         }
         Screen::Process => Line::from(format!(" {}", focus_title(app, "进程"))),
         Screen::Logs => Line::from(format!(" {}", focus_title(app, "日志"))),
     };
+    let mut line = line;
+    line.spans = fit_spans(line.spans, area.width as usize);
     frame.render_widget(Paragraph::new(line), area);
 }
 
@@ -3155,25 +3346,29 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         "输入筛选，回车确认，Esc 清除".to_string()
     } else {
         match app.screen {
-            Screen::Nav => "1 硬件  2 进程  3 容器  4 防火墙  5 网络  6 日志    j/k 选择  回车进入  q 退出".to_string(),
-            Screen::Hardware | Screen::Firewall => "j/k 选择并复制  Esc 返回  q 退出".to_string(),
+            Screen::Firewall => "j/k 选择  Esc 返回进程  q 退出".to_string(),
             Screen::Syslog if app.syslog_filtering => "筛选日志，多个词用空格隔开，回车确认，Esc 取消".to_string(),
-            Screen::Syslog if !app.syslog_unit.is_empty() => "Esc 返回  / 筛选  j/k  g/G  q 退出".to_string(),
+            Screen::Syslog if syslog_stream(app) && app.log_follow => {
+                "跟踪中  k 往上停住  G 继续跟踪  / 筛选  Esc 返回".to_string()
+            }
+            Screen::Syslog if syslog_stream(app) => "已停住跟踪  G 继续跟踪  / 筛选  Esc 返回".to_string(),
             Screen::Syslog => "1 快捷  2 审计  3 系统服务  4 内核  5 系统  6 认证  7 服务  8 定时  回车看服务日志  / 筛选".to_string(),
-            Screen::Containers if app.box_output => "j/k 选择并复制  Esc 返回列表  q 退出".to_string(),
+            Screen::Containers if app.box_output && app.box_action == Some(ContainerAction::Logs) && app.log_follow => {
+                "跟踪中  k 往上停住  G 继续跟踪  Esc 返回  q 退出".to_string()
+            }
+            Screen::Containers if app.box_output && app.box_action == Some(ContainerAction::Logs) => {
+                "已停住跟踪  G 继续跟踪  Esc 返回  q 退出".to_string()
+            }
+            Screen::Containers if app.box_output => "j/k 选择  Esc 返回列表  q 退出".to_string(),
             Screen::Containers => "j/k 选择  l 日志  i 查看  t 进程  s 资源  e 进入  Esc 返回  q 退出".to_string(),
-            Screen::Procs => "j/k 移动  回车进入  /筛选  cCPU m内存 r读 w写 pPID n名字  Esc 返回  q 退出".to_string(),
+            Screen::Procs => "j/k 移动  回车下钻  1 容器  2 防火墙  3 网络  4 日志  / 筛选  q 退出".to_string(),
             Screen::Process => "j/k 翻阅  l 日志  Esc 返回  q 退出".to_string(),
-            Screen::Logs => "j/k 翻阅  G 跟到最新  Esc 返回  q 退出".to_string(),
+            Screen::Logs if app.log_follow => "跟踪中  k 往上停住  G 继续跟踪  Esc 返回  q 退出".to_string(),
+            Screen::Logs => "已停住跟踪  G 继续跟踪  Esc 返回  q 退出".to_string(),
             Screen::Network => net_footer(app),
         }
     };
-    let text = if app.copy_hint.is_empty() {
-        text
-    } else {
-        format!("{text}  已复制")
-    };
-    let text = fit_cols(&format!(" {text}"), area.width as usize);
+    let text = plain_fit(&format!(" {text}"), area.width as usize);
     frame.render_widget(
         Paragraph::new(text).style(Style::default().fg(Color::DarkGray)),
         area,
@@ -3189,24 +3384,29 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         width,
         height,
     };
-    let text = vec![
-        Line::from("进入后先是导航。1 硬件  2 进程  3 容器  4 防火墙  5 网络  6 日志"),
-        Line::from("进程板块是原来的进程表。j/k 移动，回车下钻，l 看日志"),
-        Line::from("c m r w p n 排序。/ 筛选，空格表示都要出现"),
-        Line::from("抓包：/ 筛选  x 异常  回车拆包  p 暂停。缓冲暂停后保留"),
-        Line::from("日志：1 快捷操作  2 审计  3 系统服务，回车看该服务日志"),
-        Line::from("光标停在哪一行，这一行就复制到剪贴板"),
-        Line::from("容器：l 日志  i 查看  t 进程  s 资源  e 进入"),
-        Line::from("SSH 交给系统 ssh，这里不保存密码"),
-        Line::from("Esc 返回上一层，q 退出"),
-        Line::from(""),
-        Line::from("? 或 Esc 关闭"),
+    let inner = help_area.width.saturating_sub(2) as usize;
+    let raw = [
+        "打开就是进程页。左上角是硬件，右边是功能键",
+        "1 容器  2 防火墙  3 网络  4 日志。Esc 回到进程",
+        "j/k 移动，回车下钻，l 看这个进程的日志",
+        "c m r w p n 排序。/ 筛选，空格表示都要出现",
+        "顶部 load 依次是 1 分钟、5 分钟、15 分钟",
+        "抓包：/ 筛选  x 异常  回车拆包  p 暂停。缓冲暂停后保留",
+        "日志默认跟踪到最新，k 往上停住，G 继续跟踪。服务日志也一样",
+        "容器用本机 docker、podman、nerdctl 或 crictl，含存储卷、网络和镜像",
+        "容器：l 日志  i 查看  t 进程  s 资源  e 进入。卷、网络、镜像可以查看",
+        "SSH 交给系统 ssh，这里不保存密码",
+        "Esc 返回上一层，q 退出",
+        "",
+        "? 或 Esc 关闭",
     ];
+    let text: Vec<Line> = raw
+        .into_iter()
+        .flat_map(|line| safe_wrap(line, inner).into_iter().map(Line::from))
+        .collect();
     frame.render_widget(ratatui::widgets::Clear, help_area);
     frame.render_widget(
-        Paragraph::new(text)
-            .block(Block::default().borders(Borders::ALL).title(" 帮助 "))
-            .wrap(Wrap { trim: true }),
+        Paragraph::new(text).block(Block::default().borders(Borders::ALL).title(" 帮助 ")),
         help_area,
     );
 }
@@ -3226,7 +3426,7 @@ fn focus_extra(app: &App, proc: &ProcRate) -> ProcExtra {
             cgroup,
             fd_count: Some(12),
             nofile_soft: Some(1024),
-            stack: if proc.state == "D" {
+            stack: if proc.state.starts_with('D') {
                 Some(format!("{}\nio_schedule", proc.wchan))
             } else {
                 None
@@ -3244,7 +3444,7 @@ fn focus_extra(app: &App, proc: &ProcRate) -> ProcExtra {
             write_bytes: Some(proc.write_bps as u64),
             syscr: Some(10),
             syscw: Some(4),
-            blkio_secs: if proc.state == "D" { Some(1.2) } else { Some(0.0) },
+            blkio_secs: if proc.state.starts_with('D') { Some(1.2) } else { Some(0.0) },
             runqueue_ms: Some(3.0),
             fd_files: 4,
             fd_sockets: 6,
@@ -3379,12 +3579,26 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
             .fold(0.0, f64::max)
             .clamp(0.0, 1.0)
     });
-    let cpu = cpu_ratio
-        .map(|ratio| format!("{:3.0}%", ratio * 100.0))
-        .unwrap_or_else(|| "  …".into());
-    let mem = mem_ratio
-        .map(|ratio| format!("{:3.0}%", ratio * 100.0))
-        .unwrap_or_else(|| "  …".into());
+    let cpu = match app.rates.as_ref() {
+        Some(rates) => {
+            let ncpu = rates.cpu.ncpu.max(1);
+            let used = rates.cpu.busy_ratio * ncpu as f64;
+            format!("{:.0}%({used:.1}核/{ncpu}核)", rates.cpu.busy_ratio * 100.0)
+        }
+        None => "…".into(),
+    };
+    let mem = match mem_amounts(app) {
+        Some((used, total)) => {
+            let ratio = used as f64 / total.max(1) as f64;
+            format!(
+                "{:.0}%({}/{})",
+                ratio * 100.0,
+                capacity_text(used.saturating_mul(1024)),
+                capacity_text(total.saturating_mul(1024))
+            )
+        }
+        None => "…".into(),
+    };
     let io = io_ratio
         .map(|ratio| format!("{:3.0}%", ratio * 100.0))
         .unwrap_or_else(|| "  …".into());
@@ -3397,35 +3611,61 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
             (procs::human_bps(rx), procs::human_bps(tx))
         })
         .unwrap_or_else(|| ("…".into(), "…".into()));
-    let (load, load_color) = app
+    let (load1, load5, load15, ncpu) = app
         .rates
         .as_ref()
-        .map(|rates| {
-            let hot = rates.cpu.ncpu.max(1) as f64;
-            (
-                format!("{:.2}", rates.load1),
-                heat_color(rates.load1, hot * 0.70, hot),
-            )
-        })
-        .unwrap_or_else(|| ("…".into(), Color::Cyan));
-    let line = Line::from(vec![
-        bar_span(" CPU ", Color::Gray),
-        bar_span(cpu, cpu_ratio.map(|ratio| heat_color(ratio, 0.50, 0.80)).unwrap_or(Color::Cyan)),
-        bar_span(" │ MEM ", Color::Gray),
-        bar_span(mem, mem_ratio.map(|ratio| heat_color(ratio, 0.70, 0.90)).unwrap_or(Color::Cyan)),
-        bar_span(" │ IO ", Color::Gray),
-        bar_span(io, io_ratio.map(|ratio| heat_color(ratio, 0.50, 0.90)).unwrap_or(Color::Cyan)),
-        bar_span(" │ ↓", Color::Gray),
-        bar_span(down, Color::Cyan),
-        bar_span(" ↑", Color::Gray),
-        bar_span(up, Color::Cyan),
-        bar_span(" │ load ", Color::Gray),
-        bar_span(load, load_color),
-        bar_span(
-            format!(" │ 开机 {} │ {} │ {} ", uptime_text(), local_clock(), app.host_line),
-            Color::Gray,
-        ),
-    ]);
+        .map(|rates| (rates.load1, rates.load5, rates.load15, rates.cpu.ncpu.max(1) as f64))
+        .unwrap_or((0.0, 0.0, 0.0, 1.0));
+    let load_known = app.rates.is_some();
+    let line = Line::from(fit_spans(
+        vec![
+            bar_span(" CPU ", Color::Cyan),
+            bar_span(
+                cpu,
+                cpu_ratio
+                    .map(|ratio| heat_into(ratio, 0.50, 0.80, Color::Green))
+                    .unwrap_or(Color::Green),
+            ),
+            bar_span(" │ MEM ", Color::Magenta),
+            bar_span(
+                mem,
+                mem_ratio
+                    .map(|ratio| heat_into(ratio, 0.70, 0.90, Color::Blue))
+                    .unwrap_or(Color::Blue),
+            ),
+            bar_span(" │ IO ", Color::Yellow),
+            bar_span(
+                io,
+                io_ratio
+                    .map(|ratio| heat_into(ratio, 0.50, 0.90, Color::Cyan))
+                    .unwrap_or(Color::Cyan),
+            ),
+            bar_span(" │ ↓", Color::Green),
+            bar_span(down, Color::Green),
+            bar_span(" ↑", Color::Blue),
+            bar_span(up, Color::Blue),
+            bar_span(" │ load ", Color::White),
+            bar_span(
+                if load_known { format!("{load1:.2}") } else { "…".into() },
+                heat_into(load1, ncpu * 0.70, ncpu, Color::White),
+            ),
+            bar_span(" ", Color::DarkGray),
+            bar_span(
+                if load_known { format!("{load5:.2}") } else { "…".into() },
+                heat_into(load5, ncpu * 0.70, ncpu, Color::White),
+            ),
+            bar_span(" ", Color::DarkGray),
+            bar_span(
+                if load_known { format!("{load15:.2}") } else { "…".into() },
+                heat_into(load15, ncpu * 0.70, ncpu, Color::White),
+            ),
+            bar_span(
+                format!(" │ 开机 {} │ {} │ {} ", uptime_text(), local_clock(), app.host_line),
+                Color::Gray,
+            ),
+        ],
+        area.width as usize,
+    ));
     frame.render_widget(
         Paragraph::new(line).style(Style::default().bg(Color::DarkGray)),
         area,
@@ -3441,6 +3681,8 @@ fn metric_cell(text: impl Into<String>, color: Color) -> Cell<'static> {
 }
 
 fn push_field(lines: &mut Vec<Line<'static>>, label: &str, value: &str, color: Color, width: usize) {
+    let value = board::plain_line(value);
+    let value = value.as_str();
     let label = pad_cols(label, 10);
     let value_width = width.saturating_sub(10).max(8);
     let wrapped = wrap_text(value, value_width);
@@ -3582,55 +3824,6 @@ fn plain_paints(lines: &[String]) -> Vec<Paint> {
         .collect()
 }
 
-fn mark_copy(app: &mut App, text: &str) {
-    let text = text.trim();
-    if text.is_empty() || text == app.last_copied {
-        return;
-    }
-    app.last_copied = text.to_string();
-    app.pending_copy = Some(text.to_string());
-    let hint: String = text.chars().take(24).collect();
-    app.copy_hint = hint;
-}
-
-fn flush_copy(app: &mut App) {
-    let Some(text) = app.pending_copy.take() else {
-        return;
-    };
-    let mut out = io::stdout();
-    let _ = write!(out, "\x1b]52;c;{}\x1b\\", base64_encode(text.as_bytes()));
-    let _ = out.flush();
-}
-
-fn base64_encode(data: &[u8]) -> String {
-    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::new();
-    let mut index = 0;
-    while index + 3 <= data.len() {
-        let chunk = ((data[index] as u32) << 16) | ((data[index + 1] as u32) << 8) | data[index + 2] as u32;
-        out.push(TABLE[((chunk >> 18) & 63) as usize] as char);
-        out.push(TABLE[((chunk >> 12) & 63) as usize] as char);
-        out.push(TABLE[((chunk >> 6) & 63) as usize] as char);
-        out.push(TABLE[(chunk & 63) as usize] as char);
-        index += 3;
-    }
-    let rest = data.len() - index;
-    if rest == 1 {
-        let chunk = (data[index] as u32) << 16;
-        out.push(TABLE[((chunk >> 18) & 63) as usize] as char);
-        out.push(TABLE[((chunk >> 12) & 63) as usize] as char);
-        out.push('=');
-        out.push('=');
-    } else if rest == 2 {
-        let chunk = ((data[index] as u32) << 16) | ((data[index + 1] as u32) << 8);
-        out.push(TABLE[((chunk >> 18) & 63) as usize] as char);
-        out.push(TABLE[((chunk >> 12) & 63) as usize] as char);
-        out.push(TABLE[((chunk >> 6) & 63) as usize] as char);
-        out.push('=');
-    }
-    out
-}
-
 fn pad_cols(text: &str, cols: usize) -> String {
     let mut out = text.to_string();
     let mut width = display_cols(&out);
@@ -3642,11 +3835,9 @@ fn pad_cols(text: &str, cols: usize) -> String {
 }
 
 fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
     if text.is_empty() {
         return vec![String::new()];
-    }
-    if width < 4 {
-        return vec![text.to_string()];
     }
     let mut lines = Vec::new();
     let mut current = String::new();
@@ -3883,13 +4074,62 @@ fn per_sec(prev: u64, curr: u64, secs: f64) -> f64 {
 }
 
 fn heat_color(value: f64, warm: f64, hot: f64) -> Color {
+    heat_into(value, warm, hot, Color::Cyan)
+}
+
+fn heat_into(value: f64, warm: f64, hot: f64, cool: Color) -> Color {
     if value >= hot {
         Color::Red
     } else if value >= warm {
         Color::Yellow
     } else {
-        Color::Cyan
+        cool
     }
+}
+
+fn plain_fit(text: &str, cols: usize) -> String {
+    fit_cols(&board::plain_line(text), cols)
+}
+
+fn safe_wrap(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let plain = board::plain_line(text);
+    if plain.is_empty() {
+        return vec![String::new()];
+    }
+    wrap_text(&plain, width)
+        .into_iter()
+        .map(|line| fit_cols(&line, width))
+        .collect()
+}
+
+fn fit_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let mut used = 0usize;
+    let mut out = Vec::new();
+    for span in spans {
+        if used >= width {
+            break;
+        }
+        let cols = span_cols(&span);
+        if used + cols <= width {
+            used += cols;
+            out.push(span);
+        } else {
+            let fitted = fit_cols(span.content.as_ref(), width - used);
+            if !fitted.is_empty() {
+                out.push(Span::styled(fitted, span.style));
+            }
+            break;
+        }
+    }
+    out
+}
+
+fn span_cols(span: &Span<'_>) -> usize {
+    display_cols(span.content.as_ref())
 }
 
 fn mem_color(app: &App, rss_kb: u64) -> Color {
@@ -3905,10 +4145,10 @@ fn mem_color(app: &App, rss_kb: u64) -> Color {
 }
 
 fn state_color(state: &str) -> Color {
-    match state {
-        "R" => Color::Green,
-        "D" => Color::Yellow,
-        "Z" | "T" | "t" => Color::Red,
+    match state.chars().next() {
+        Some('R') => Color::Green,
+        Some('D') => Color::Yellow,
+        Some('Z') | Some('T') | Some('t') => Color::Red,
         _ => Color::Gray,
     }
 }
@@ -3923,7 +4163,7 @@ fn fd_color(extra: &ProcExtra) -> Color {
 }
 
 fn advice_color(proc: &ProcRate) -> Color {
-    if proc.state == "D" || proc.vmswap_kb > 0 {
+    if proc.state.starts_with('D') || proc.vmswap_kb > 0 {
         Color::Red
     } else if proc.cpu_ratio >= 0.90 || proc.read_bps + proc.write_bps >= 5_000_000.0 {
         Color::Yellow
@@ -3939,6 +4179,17 @@ fn severity_color(severity: Severity) -> Color {
         Severity::Warning => Color::Yellow,
         Severity::Critical => Color::Red,
     }
+}
+
+fn mem_amounts(app: &App) -> Option<(u64, u64)> {
+    if let Some(rates) = &app.rates {
+        let total = rates.mem_total_kb;
+        let used = total.saturating_sub(rates.mem_available_kb);
+        return Some((used, total));
+    }
+    let sample = app.latest.as_ref()?;
+    let total = sample.mem.total_kb;
+    Some((total.saturating_sub(sample.mem.available_kb), total))
 }
 
 fn mem_used(app: &App) -> Option<f64> {
@@ -3991,7 +4242,8 @@ fn local_clock() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_uptime, heat_color, log_window, place_cursor, sort_rows, toggle_sort, App, Screen,
+        close_syslog_unit, format_uptime, heat_color, log_window, move_cursor_to, place_cursor,
+        process_title, sort_rows, toggle_sort, visible_procs, App, Screen,
         SortKey, TableState,
     };
     use ratatui::style::Color;
@@ -4041,10 +4293,88 @@ mod tests {
     }
 
     #[test]
+    fn process_title_counts_each_state() {
+        let mut rows = vec![
+            proc(1, "nginx", 0.1, 1, 0.0),
+            proc(2, "sshd", 0.1, 1, 0.0),
+            proc(3, "fio", 0.1, 1, 0.0),
+        ];
+        rows[0].state = "Ss+".into();
+        rows[1].state = "Ss+".into();
+        rows[2].state = "D".into();
+        assert_eq!(process_title(&rows, 120), " 进程  3  Ss+ 2  D 1 ");
+    }
+
+    #[test]
     fn log_window_follows_the_tail() {
         let lines: Vec<_> = (0..10).map(|index| index.to_string()).collect();
         assert_eq!(log_window(&lines, 3, 0), vec!["7", "8", "9"]);
         assert_eq!(log_window(&lines, 3, 2), vec!["5", "6", "7"]);
+    }
+
+    #[test]
+    fn disks_list_each_device_and_the_total() {
+        let disks = vec![
+            crate::board::HwDisk {
+                name: "vda".into(),
+                size: String::new(),
+                bytes: 100 * 1024 * 1024 * 1024u64,
+                model: String::new(),
+                serial: String::new(),
+                kind: String::new(),
+            },
+            crate::board::HwDisk {
+                name: "vdb".into(),
+                size: String::new(),
+                bytes: 500 * 1024 * 1024 * 1024u64,
+                model: String::new(),
+                serial: String::new(),
+                kind: String::new(),
+            },
+        ];
+        let text = super::disk_line(&disks);
+        assert_eq!(text, "共600.0GiB [ vda 100.0GiB   vdb 500.0GiB ]");
+    }
+
+    #[test]
+    fn long_field_keeps_its_label() {
+        let spans = super::fit_spans(
+            vec![ratatui::text::Span::raw("内存  "), ratatui::text::Span::raw("x".repeat(80))],
+            16,
+        );
+        let text: String = spans.iter().map(|span| span.content.to_string()).collect();
+        assert!(text.starts_with("内存"));
+        assert!(super::display_cols(&text) <= 16);
+    }
+
+    #[test]
+    fn shortcut_columns_share_a_grid() {
+        assert_eq!(super::display_cols(&super::key_cell("1")), 4);
+        assert_eq!(super::display_cols(&super::key_cell("回车")), 4);
+        assert_eq!(super::display_cols(&super::label_cell("防火墙")), 7);
+        let top = super::hint_line(&[("1", "容器"), ("c", "CPU")], 40);
+        let next = super::hint_line(&[("2", "防火墙"), ("r", "读")], 40);
+        let second = |line: &ratatui::text::Line| {
+            let mut used = 0usize;
+            for span in &line.spans {
+                let text = span.content.as_ref();
+                if text.contains('c') || text.contains('r') {
+                    return used;
+                }
+                used += super::display_cols(text);
+            }
+            used
+        };
+        assert_eq!(second(&top), second(&next));
+    }
+
+    #[test]
+    fn colored_text_cannot_paint_past_the_edge() {
+        let raw = format!("\u{1b}[31m{}\t{} \u{1b}[0m", "drop", "x".repeat(80));
+        let parts = super::safe_wrap(&raw, 20);
+        assert!(parts.len() > 1);
+        assert!(parts.iter().all(|part| !part.contains('\u{1b}') && !part.contains('\t')));
+        assert!(parts.iter().all(|part| super::display_cols(part) <= 20));
     }
 
     #[test]
@@ -4104,11 +4434,6 @@ mod tests {
     }
 
     #[test]
-    fn clipboard_text_is_base64() {
-        assert_eq!(super::base64_encode(b"eth0"), "ZXRoMA==");
-    }
-
-    #[test]
     fn long_command_wraps_without_dropping_characters() {
         let command = "minio server --address :9000 --console-address :9001 /data/tenant/bucket";
         let lines = super::wrap_text(command, 24);
@@ -4147,11 +4472,10 @@ mod tests {
             filtering: false,
             filter: String::new(),
             screen: Screen::Procs,
-            banner: None,
-            nav_cursor: 0,
             board_scroll: 0,
-            virt: String::new(),
-            containers: Vec::new(),
+            inventory: crate::containers::Inventory::empty(""),
+            container_picks: Vec::new(),
+            container_place: false,
             firewall: crate::board::FirewallView::empty(),
             net: crate::board::NetConfig::empty(),
             net_focus: super::NetFocus::Config,
@@ -4171,12 +4495,15 @@ mod tests {
             packet_scroll: 0,
             board_cursor: 0,
             board_rows: Vec::new(),
-            pending_copy: None,
-            last_copied: String::new(),
-            copy_hint: String::new(),
+            box_cursor: 0,
+            box_scroll: 0,
+            syslog_anchor: None,
+            capture_from_ifaces: false,
             hardware: crate::board::HardwareInfo::empty(),
             box_output: false,
             box_exec: false,
+            box_action: None,
+            box_pick: None,
             box_title: String::new(),
             box_lines: Vec::new(),
             iface_cursor: 0,
@@ -4204,6 +4531,7 @@ mod tests {
             log_lines: Vec::new(),
             log_note: String::new(),
             log_from_bottom: 0,
+            log_follow: true,
             process_scroll: 0,
             iface_prev: None,
             status: String::new(),
@@ -4214,5 +4542,22 @@ mod tests {
         place_cursor(&mut app, &visible);
         assert_eq!(app.cursor, 0);
         assert_eq!(visible[app.cursor].comm, "nginx");
+
+        let visible = visible_procs(&app);
+        move_cursor_to(&mut app, &visible, 1);
+        let pid = visible[1].pid;
+        app.focus_pid = Some(pid);
+        app.home_pid = None;
+        app.home_pid = app.focus_pid.or(app.home_pid);
+        let visible = visible_procs(&app);
+        place_cursor(&mut app, &visible);
+        assert_eq!(visible[app.cursor].pid, pid);
+
+        app.syslog_kind = 2;
+        app.syslog_unit = "ssh.service".into();
+        app.syslog_anchor = Some(9);
+        close_syslog_unit(&mut app);
+        assert!(app.syslog_unit.is_empty());
+        assert_eq!(app.board_cursor, 3);
     }
 }
